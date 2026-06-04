@@ -21,19 +21,22 @@ const SCORE_THRESHOLD = 0.45
 const POSITION_ALPHA = 0.35
 const SCORE_ALPHA = 0.15
 const ENTRY_ANIM_MS = 600
-const SPOTIFY_ENTRY_MS = 700
+const SPOTIFY_ENTRY_MS = 900
 const PALM_PROXIMITY_RATIO = 0.6
 const STILLNESS_DWELL_MS = 1500
 const STILLNESS_MOVE_PX = 25
-const EVADE_INFLUENCE_PX = 200
-const EVADE_MAX_OFFSET_PX = 90
+const EVADE_MIN_DIST_PX = 130        // 효과와 손 사이 최소 거리 (절대 못 닿음)
+const EVADE_RELEASE_PX = 220         // 손이 이만큼 멀어지면 효과 복귀
+const MAGNET_RANGE_PX = 300
 const FS_UI_HIDE_MS = 3000
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 type BBox = { x: number; y: number; w: number; h: number }
 type EffectType = 'none' | 'spotify' | 'halo' | 'sequence' | 'ring' | 'particles'
 type ShapeMode = 'none' | 'box' | 'silhouette-bg' | 'silhouette-fg'
-type InteractionMode = 'none' | 'palm-hide' | 'stillness-boost' | 'jump-grow' | 'evade'
+type InteractionMode =
+  | 'none' | 'palm-hide' | 'stillness-boost' | 'jump-grow' | 'evade'
+  | 'magnet' | 'hands-up'
 
 type Track = {
   id: number
@@ -48,6 +51,7 @@ type Track = {
   prevTopY: number | null
   jumpBoost: number
   evadeOffset: { x: number; y: number }
+  handsUpBoost: number
 }
 
 export default function App() {
@@ -69,7 +73,6 @@ export default function App() {
   const [fsUiVisible, setFsUiVisible] = useState(true)
   const [isFullscreen, setIsFullscreen] = useState(false)
 
-  // 거울은 항상 ON으로 고정
   const mirrorRef = useRef(true)
   const showOverlayRef = useRef(true)
   const refs = {
@@ -86,14 +89,12 @@ export default function App() {
   const lastGestureRef = useRef<GestureRecognizerResult | null>(null)
   const lastSegMaskRef = useRef<ImageSegmenterResult | null>(null)
 
-  // 효과 변경 시 모든 트랙의 등장 애니 재시작
   function setEffect(next: EffectType) {
     const now = performance.now()
     for (const t of tracksRef.current) t.effectStartedAt = now
     setEffectState(next)
   }
 
-  // 마우스/터치 움직임 감지 → 풀스크린 UI 자동 숨김
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null
     function show() {
@@ -113,7 +114,6 @@ export default function App() {
     }
   }, [])
 
-  // 풀스크린 상태 추적
   useEffect(() => {
     function onChange() { setIsFullscreen(!!document.fullscreenElement) }
     document.addEventListener('fullscreenchange', onChange)
@@ -150,10 +150,7 @@ export default function App() {
             outputConfidenceMasks: false,
           }),
         ])
-        if (cancelled) {
-          detector.close(); gesture.close(); segmenter.close()
-          return
-        }
+        if (cancelled) { detector.close(); gesture.close(); segmenter.close(); return }
         detectorRef.current = detector
         gestureRef.current = gesture
         segmenterRef.current = segmenter
@@ -230,7 +227,6 @@ export default function App() {
     ctx.drawImage(video, 0, 0, vw, vh)
     ctx.restore()
 
-    // ─── Person detection
     let objResult: ObjectDetectorResult | undefined
     try { objResult = detector.detectForVideo(video, ts) } catch { return }
     const detections: { bbox: BBox; score: number }[] = []
@@ -246,14 +242,12 @@ export default function App() {
     updateTracks(tracksRef.current, detections, ts, nextIdRef)
     if (tracksRef.current.length !== trackCount) setTrackCount(tracksRef.current.length)
 
-    // ─── Gesture
     let gestureResult: GestureRecognizerResult | undefined
     try { gestureResult = gesture.recognizeForVideo(video, ts) } catch { /* skip */ }
     if (gestureResult) lastGestureRef.current = gestureResult
 
     applyInteraction(tracksRef.current, lastGestureRef.current, refs.interaction.current, vw, vh, ts, refs.effect.current)
 
-    // ─── 표시
     const shapeMode = refs.shape.current
     if (shapeMode === 'silhouette-bg' || shapeMode === 'silhouette-fg') {
       try {
@@ -268,10 +262,10 @@ export default function App() {
       for (const t of tracksRef.current) drawBBox(ctx, t, vw, mirrored)
     }
     if (shapeMode !== 'none') {
-      for (const t of tracksRef.current) drawHeadLabel(ctx, t, vw, mirrored)
+      // 표시용 번호는 화면에 보이는 순서 인덱스(1..N) — 사람이 빠지면 다음 사람이 그 번호를 가져감
+      tracksRef.current.forEach((t, i) => drawHeadLabel(ctx, t, i + 1, vw, mirrored))
     }
 
-    // ─── 효과 렌더
     if (showOverlayRef.current && refs.effect.current !== 'none') {
       const fxType = refs.effect.current
       for (const t of tracksRef.current) {
@@ -290,8 +284,8 @@ export default function App() {
         type="button"
         onClick={() => setStatusVisible((v) => !v)}
         style={hiddenToggleStyle}
-        title="상태 토글"
-        aria-label="상태 토글"
+        title="Toggle status"
+        aria-label="Toggle status"
       />
       {statusVisible && (
         <StatusOverlay status={status} errorMsg={errorMsg} fps={fps} trackCount={trackCount} />
@@ -308,9 +302,7 @@ export default function App() {
         setInteraction={setInteraction}
       />
 
-      {fsUiVisible && (
-        <FullscreenButton isFullscreen={isFullscreen} />
-      )}
+      {fsUiVisible && (<FullscreenButton isFullscreen={isFullscreen} />)}
     </div>
   )
 }
@@ -361,6 +353,7 @@ function updateTracks(
       prevTopY: det.bbox.y,
       jumpBoost: 0,
       evadeOffset: { x: 0, y: 0 },
+      handsUpBoost: 0,
     })
   }
   for (let i = tracks.length - 1; i >= 0; i--) {
@@ -379,17 +372,17 @@ function iouOf(a: BBox, b: BBox): number {
 
 function lerp(a: number, b: number, t: number): number { return a + (b - a) * t }
 function clamp(v: number, lo: number, hi: number): number { return Math.max(lo, Math.min(hi, v)) }
-function easeOut(t: number): number { return 1 - Math.pow(1 - t, 3) }
+function easeOutCubic(t: number): number { return 1 - Math.pow(1 - t, 3) }
+function easeOutQuint(t: number): number { return 1 - Math.pow(1 - t, 5) }
 
-// ─── 효과 위치 계산 (인터랙션과 렌더에서 공유) ──────────
+// ─── 효과 anchor (인터랙션·렌더 공유) ────────────────────
 
 function effectAnchor(t: Track, fx: EffectType) {
   const headSize = Math.max(40, t.bbox.w * 0.35)
   if (fx === 'spotify') {
-    // 머리 우상단 옆, 얼굴 안 가리는 위치
     return {
-      cx: t.bbox.x + t.bbox.w / 2 + headSize * 0.85,
-      cy: t.bbox.y + headSize * 0.35,
+      cx: t.bbox.x + t.bbox.w / 2 + headSize * 0.7,
+      cy: t.bbox.y + headSize * 0.3,
       headSize,
     }
   }
@@ -414,7 +407,7 @@ function applyInteraction(
   for (const t of tracks) {
     const age = now - t.firstSeenAt
     const entryFactor = clamp(age / ENTRY_ANIM_MS, 0, 1)
-    const entryVis = easeOut(entryFactor)
+    const entryVis = easeOutCubic(entryFactor)
     let targetVis = entryVis
 
     const cx = t.bbox.x + t.bbox.w / 2
@@ -434,6 +427,7 @@ function applyInteraction(
     t.prevTopY = t.bbox.y
 
     let evadeTargetX = 0, evadeTargetY = 0
+    let handsUpTarget = 0
 
     if (mode === 'palm-hide' && gesture) {
       if (palmCloseToTrack(gesture, t.bbox, vw, vh)) targetVis = 0
@@ -441,36 +435,88 @@ function applyInteraction(
       if (t.stillSince !== null && now - t.stillSince > STILLNESS_DWELL_MS) targetVis = entryVis
       else targetVis = entryVis * 0.45
     } else if (mode === 'evade' && gesture && gesture.landmarks) {
+      // 효과를 손에서 항상 최소 거리 유지하도록 강제로 밀어냄 (절대 안 닿음)
       const anchor = effectAnchor(t, effect)
-      const fxCx = anchor.cx + t.evadeOffset.x
-      const fxCy = anchor.cy + t.evadeOffset.y
-      let totalX = 0, totalY = 0
+      const baseX = anchor.cx
+      const baseY = anchor.cy
+      const currX = baseX + t.evadeOffset.x
+      const currY = baseY + t.evadeOffset.y
+
+      let closest = Infinity
+      let pushX = 0, pushY = 0
       for (const lm of gesture.landmarks) {
         if (!lm?.length) continue
         const wrist = lm[0]
         const mid = lm[9] ?? lm[0]
         const hx = ((wrist.x + mid.x) / 2) * vw
         const hy = ((wrist.y + mid.y) / 2) * vh
-        const dist = Math.hypot(hx - fxCx, hy - fxCy)
-        if (dist < EVADE_INFLUENCE_PX) {
-          const dirX = fxCx - hx
-          const dirY = fxCy - hy
-          const len = Math.hypot(dirX, dirY) || 1
-          const strength = ((EVADE_INFLUENCE_PX - dist) / EVADE_INFLUENCE_PX) * EVADE_MAX_OFFSET_PX
-          totalX += (dirX / len) * strength
-          totalY += (dirY / len) * strength
+        const d = Math.hypot(hx - currX, hy - currY)
+        if (d < closest) {
+          closest = d
+          if (d < EVADE_MIN_DIST_PX) {
+            let dirX = currX - hx
+            let dirY = currY - hy
+            const len = Math.hypot(dirX, dirY)
+            if (len < 0.5) { dirX = 0; dirY = -1 } // 손 위에 정확히 겹쳤을 때 위로 도망
+            const nx = dirX / (len || 1)
+            const ny = dirY / (len || 1)
+            const newX = hx + nx * EVADE_MIN_DIST_PX
+            const newY = hy + ny * EVADE_MIN_DIST_PX
+            pushX = newX - baseX
+            pushY = newY - baseY
+          }
         }
       }
-      evadeTargetX = totalX
-      evadeTargetY = totalY
+      if (closest > EVADE_RELEASE_PX) { pushX = 0; pushY = 0 }
+      evadeTargetX = pushX
+      evadeTargetY = pushY
+      // push는 즉각, 복귀는 부드럽게
+      const k = (pushX !== 0 || pushY !== 0) ? 0.85 : 0.08
+      t.evadeOffset.x = lerp(t.evadeOffset.x, evadeTargetX, k)
+      t.evadeOffset.y = lerp(t.evadeOffset.y, evadeTargetY, k)
+    } else if (mode === 'magnet' && gesture && gesture.landmarks) {
+      // 손 가까이 오면 효과가 손 쪽으로 끌림
+      const anchor = effectAnchor(t, effect)
+      let bestDx = 0, bestDy = 0, bestPull = 0
+      for (const lm of gesture.landmarks) {
+        if (!lm?.length) continue
+        const wrist = lm[0]
+        const mid = lm[9] ?? lm[0]
+        const hx = ((wrist.x + mid.x) / 2) * vw
+        const hy = ((wrist.y + mid.y) / 2) * vh
+        const dx = hx - anchor.cx
+        const dy = hy - anchor.cy
+        const dist = Math.hypot(dx, dy)
+        if (dist < MAGNET_RANGE_PX) {
+          const pull = (MAGNET_RANGE_PX - dist) / MAGNET_RANGE_PX * 0.85
+          if (pull > bestPull) { bestPull = pull; bestDx = dx * pull; bestDy = dy * pull }
+        }
+      }
+      t.evadeOffset.x = lerp(t.evadeOffset.x, bestDx, 0.25)
+      t.evadeOffset.y = lerp(t.evadeOffset.y, bestDy, 0.25)
+    } else if (mode === 'hands-up' && gesture && gesture.landmarks) {
+      // 양손이 머리 위에 있으면 효과가 커짐
+      let handsAbove = 0
+      const headLine = t.bbox.y + t.bbox.w * 0.2
+      for (const lm of gesture.landmarks) {
+        if (!lm?.length) continue
+        const wrist = lm[0]
+        const hy = wrist.y * vh
+        if (hy < headLine) handsAbove++
+      }
+      handsUpTarget = handsAbove >= 2 ? 1 : 0
+      t.handsUpBoost = lerp(t.handsUpBoost, handsUpTarget, 0.12)
     }
+
+    if (mode !== 'evade' && mode !== 'magnet') {
+      // 위에서 처리 안한 모드일 때 evadeOffset 자연 복귀
+      t.evadeOffset.x = lerp(t.evadeOffset.x, 0, 0.15)
+      t.evadeOffset.y = lerp(t.evadeOffset.y, 0, 0.15)
+    }
+    if (mode !== 'hands-up') t.handsUpBoost = lerp(t.handsUpBoost, 0, 0.08)
 
     const visK = mode === 'palm-hide' ? 0.27 : 0.13
     t.effectVisibility = lerp(t.effectVisibility, targetVis, visK)
-
-    const evadeK = (evadeTargetX !== 0 || evadeTargetY !== 0) ? 0.3 : 0.12
-    t.evadeOffset.x = lerp(t.evadeOffset.x, evadeTargetX, evadeK)
-    t.evadeOffset.y = lerp(t.evadeOffset.y, evadeTargetY, evadeK)
   }
 }
 
@@ -504,27 +550,37 @@ function drawEffect(
 ) {
   const anchor = effectAnchor(t, fx)
   let cx = anchor.cx + t.evadeOffset.x
-  const cy = anchor.cy + t.evadeOffset.y
+  let cy = anchor.cy + t.evadeOffset.y
   if (mirrored) cx = vw - cx
 
   const jumpScale = 1 + t.jumpBoost * 0.6
+  const handsUpScale = 1 + t.handsUpBoost * 0.9
 
   if (fx === 'spotify') {
     const age = ts - t.effectStartedAt
     const tt = clamp(age / SPOTIFY_ENTRY_MS, 0, 1)
-    const overshoot = Math.sin(tt * Math.PI * 2.3) * Math.exp(-tt * 3.2) * 0.5
-    const entryScale = clamp(easeOut(tt) + overshoot, 0, 1.5)
-    const r = anchor.headSize * 0.5 * entryScale * jumpScale * t.effectVisibility
-    if (r < 0.5) return
+    // 세련된 등장: cubic ease-out scale + 살짝 회전 + fade
+    const entryScale = easeOutCubic(tt)
+    const entryRotation = (1 - easeOutQuint(tt)) * -0.5  // -0.5rad → 0
+    const entryAlpha = easeOutCubic(clamp(tt * 1.4, 0, 1))
+
+    // idle 애니메이션 (등장 후에도 계속 움직임)
+    const idleScale = 1 + Math.sin(ts / 1300 + t.id * 0.7) * 0.06
+    const floatX = Math.sin(ts / 1100 + t.id * 0.5) * anchor.headSize * 0.04
+    const floatY = Math.sin(ts / 900 + t.id) * anchor.headSize * 0.05
+    const idleRot = Math.sin(ts / 2400 + t.id * 0.3) * 0.10
+
+    const finalR = anchor.headSize * 0.1 * entryScale * idleScale * jumpScale * handsUpScale * t.effectVisibility
+    if (finalR < 0.5) return
+
     ctx.save()
-    ctx.globalAlpha *= t.effectVisibility
-    drawSpotifyLogo(ctx, cx, cy, r)
+    ctx.globalAlpha *= entryAlpha * t.effectVisibility
+    drawSpotifyLogo(ctx, cx + floatX, cy + floatY, finalR, entryRotation + idleRot)
     ctx.restore()
     return
   }
 
-  const scale = lerp(0.5, 1.0, t.effectVisibility) * jumpScale
-
+  const scale = lerp(0.5, 1.0, t.effectVisibility) * jumpScale * handsUpScale
   ctx.save()
   ctx.globalAlpha *= t.effectVisibility
   ctx.globalCompositeOperation = 'screen'
@@ -537,16 +593,19 @@ function drawEffect(
   ctx.restore()
 }
 
-function drawSpotifyLogo(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number) {
+function drawSpotifyLogo(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, rotation = 0) {
   if (r < 1) return
-  // 그림자
+  ctx.save()
+  ctx.translate(cx, cy)
+  ctx.rotate(rotation)
+
   ctx.shadowColor = 'rgba(0,0,0,0.4)'
-  ctx.shadowBlur = r * 0.4
-  ctx.shadowOffsetY = r * 0.08
+  ctx.shadowBlur = r * 0.5
+  ctx.shadowOffsetY = r * 0.12
 
   ctx.fillStyle = '#1DB954'
   ctx.beginPath()
-  ctx.arc(cx, cy, r, 0, Math.PI * 2)
+  ctx.arc(0, 0, r, 0, Math.PI * 2)
   ctx.fill()
   ctx.shadowBlur = 0
   ctx.shadowOffsetY = 0
@@ -561,10 +620,11 @@ function drawSpotifyLogo(ctx: CanvasRenderingContext2D, cx: number, cy: number, 
   for (const b of bars) {
     ctx.lineWidth = b.lw
     ctx.beginPath()
-    const yCenter = cy + b.yo + b.rad * 0.55
-    ctx.arc(cx, yCenter, b.rad, Math.PI * 1.18, Math.PI * 1.82)
+    const yCenter = b.yo + b.rad * 0.55
+    ctx.arc(0, yCenter, b.rad, Math.PI * 1.18, Math.PI * 1.82)
     ctx.stroke()
   }
+  ctx.restore()
 }
 
 function drawHalo(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number) {
@@ -587,7 +647,6 @@ function drawSequenceFrame(ctx: CanvasRenderingContext2D, cx: number, cy: number
   grad.addColorStop(1, 'rgba(80, 120, 255, 0)')
   ctx.fillStyle = grad
   ctx.beginPath(); ctx.arc(cx, cy, r * pulse, 0, Math.PI * 2); ctx.fill()
-
   const N = 6
   for (let i = 0; i < N; i++) {
     const a = phase + (i / N) * Math.PI * 2
@@ -630,7 +689,7 @@ function drawParticles(ctx: CanvasRenderingContext2D, cx: number, cy: number, r:
   }
 }
 
-// ─── 시각화: 박스 / 윤곽 / 라벨 ─────────────────────────
+// ─── 시각화 ─────────────────────────────────────────────
 
 function drawBBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirrored: boolean) {
   let x = t.bbox.x
@@ -644,12 +703,12 @@ function drawBBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirrored:
   ctx.restore()
 }
 
-function drawHeadLabel(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirrored: boolean) {
+function drawHeadLabel(ctx: CanvasRenderingContext2D, t: Track, displayNum: number, vw: number, mirrored: boolean) {
   let cx = t.bbox.x + t.bbox.w / 2
   if (mirrored) cx = vw - cx
   const yTop = Math.max(28, t.bbox.y)
   const color = colorForId(t.id)
-  const label = `#${t.id}  ${(t.score * 100).toFixed(0)}%`
+  const label = `#${displayNum}  ${(t.score * 100).toFixed(0)}%`
 
   ctx.save()
   ctx.font = 'bold 18px ui-monospace, Menlo, monospace'
@@ -657,7 +716,6 @@ function drawHeadLabel(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirr
   ctx.textBaseline = 'bottom'
   const textW = ctx.measureText(label).width
   const padX = 10
-  const padY = 4
   const labelH = 26
   const bx = cx - textW / 2 - padX
   const by = yTop - labelH - 6
@@ -667,7 +725,7 @@ function drawHeadLabel(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirr
   ctx.lineWidth = 1.5
   ctx.strokeRect(bx, by, textW + padX * 2, labelH)
   ctx.fillStyle = color
-  ctx.fillText(label, cx, by + labelH - padY)
+  ctx.fillText(label, cx, by + labelH - 4)
   ctx.restore()
 }
 
@@ -692,7 +750,6 @@ function drawSilhouette(
   const baseR = side === 'bg' ? 0 : 255
   const baseG = side === 'bg' ? 255 : 120
   const baseB = side === 'bg' ? 200 : 60
-
   for (let i = 0; i < data.length; i++) {
     const v = data[i]
     const matches = targetIsZero ? (v === 0) : (v !== 0)
@@ -704,7 +761,6 @@ function drawSilhouette(
     }
   }
   offCtx.putImageData(img, 0, 0)
-
   ctx.save()
   if (mirrored) { ctx.translate(vw, 0); ctx.scale(-1, 1) }
   ctx.globalCompositeOperation = 'screen'
@@ -722,7 +778,7 @@ function drawSilhouette(
 const COLORS = ['#7ee', '#ff7', '#f7f', '#7f7', '#f77', '#77f', '#fa7', '#7fa', '#a7f', '#f7a']
 function colorForId(id: number): string { return COLORS[id % COLORS.length] }
 
-// ─── UI: 좌상단 상태 (텍스트만, 이모지 X) ───────────────
+// ─── UI: status overlay (English text only) ─────────────
 
 function StatusOverlay(props: { status: Status; errorMsg: string; fps: number; trackCount: number }) {
   const { status, errorMsg, fps, trackCount } = props
@@ -750,7 +806,7 @@ function StatusOverlay(props: { status: Status; errorMsg: string; fps: number; t
   )
 }
 
-// ─── UI: 하단 중앙 패널 ─────────────────────────────────
+// ─── UI: bottom panel ───────────────────────────────────
 
 function BottomPanel(props: {
   open: boolean
@@ -763,42 +819,41 @@ function BottomPanel(props: {
   setInteraction: React.Dispatch<React.SetStateAction<InteractionMode>>
 }) {
   const { open, toggle, effect, shape, interaction, setEffect, setShape, setInteraction } = props
-
   return (
     <div style={bottomWrapStyle}>
       {open && (
         <div style={panelStyle}>
-          <Row label="표시">
-            <Toggle on={shape === 'none'} onClick={() => setShape('none')}>없음</Toggle>
-            <Toggle on={shape === 'box'} onClick={() => setShape('box')}>박스</Toggle>
-            <Toggle on={shape === 'silhouette-bg'} onClick={() => setShape('silhouette-bg')}>윤곽-배경</Toggle>
-            <Toggle on={shape === 'silhouette-fg'} onClick={() => setShape('silhouette-fg')}>윤곽-사람</Toggle>
+          <Row label="Display">
+            <Toggle on={shape === 'none'} onClick={() => setShape('none')}>None</Toggle>
+            <Toggle on={shape === 'box'} onClick={() => setShape('box')}>Box</Toggle>
+            <Toggle on={shape === 'silhouette-bg'} onClick={() => setShape('silhouette-bg')}>Silhouette-bg</Toggle>
+            <Toggle on={shape === 'silhouette-fg'} onClick={() => setShape('silhouette-fg')}>Silhouette-fg</Toggle>
           </Row>
-          <Row label="효과">
-            <Toggle on={effect === 'none'} onClick={() => setEffect('none')}>없음</Toggle>
-            <Toggle on={effect === 'spotify'} onClick={() => setEffect('spotify')}>spotify</Toggle>
-            <Toggle on={effect === 'halo'} onClick={() => setEffect('halo')}>halo</Toggle>
-            <Toggle on={effect === 'sequence'} onClick={() => setEffect('sequence')}>시퀀스</Toggle>
-            <Toggle on={effect === 'ring'} onClick={() => setEffect('ring')}>ring</Toggle>
-            <Toggle on={effect === 'particles'} onClick={() => setEffect('particles')}>파티클</Toggle>
+          <Row label="Effect">
+            <Toggle on={effect === 'none'} onClick={() => setEffect('none')}>None</Toggle>
+            <Toggle on={effect === 'spotify'} onClick={() => setEffect('spotify')}>Spotify</Toggle>
+            <Toggle on={effect === 'halo'} onClick={() => setEffect('halo')}>Halo</Toggle>
+            <Toggle on={effect === 'sequence'} onClick={() => setEffect('sequence')}>Sequence</Toggle>
+            <Toggle on={effect === 'ring'} onClick={() => setEffect('ring')}>Ring</Toggle>
+            <Toggle on={effect === 'particles'} onClick={() => setEffect('particles')}>Particles</Toggle>
           </Row>
-          <Row label="상호작용">
-            <Toggle on={interaction === 'none'} onClick={() => setInteraction('none')}>없음</Toggle>
-            <Toggle on={interaction === 'palm-hide'} onClick={() => setInteraction('palm-hide')}>손바닥숨김</Toggle>
-            <Toggle on={interaction === 'stillness-boost'} onClick={() => setInteraction('stillness-boost')}>정지강화</Toggle>
-            <Toggle on={interaction === 'jump-grow'} onClick={() => setInteraction('jump-grow')}>점프확대</Toggle>
-            <Toggle on={interaction === 'evade'} onClick={() => setInteraction('evade')}>도망</Toggle>
+          <Row label="Interaction">
+            <Toggle on={interaction === 'none'} onClick={() => setInteraction('none')}>None</Toggle>
+            <Toggle on={interaction === 'palm-hide'} onClick={() => setInteraction('palm-hide')}>Palm hide</Toggle>
+            <Toggle on={interaction === 'stillness-boost'} onClick={() => setInteraction('stillness-boost')}>Stillness</Toggle>
+            <Toggle on={interaction === 'jump-grow'} onClick={() => setInteraction('jump-grow')}>Jump</Toggle>
+            <Toggle on={interaction === 'evade'} onClick={() => setInteraction('evade')}>Evade</Toggle>
+            <Toggle on={interaction === 'magnet'} onClick={() => setInteraction('magnet')}>Magnet</Toggle>
+            <Toggle on={interaction === 'hands-up'} onClick={() => setInteraction('hands-up')}>Hands up</Toggle>
           </Row>
         </div>
       )}
-      <button type="button" onClick={toggle} title="효과 패널" style={fabStyle(open)}>
+      <button type="button" onClick={toggle} title="Effects panel" style={fabStyle(open)}>
         <SparkleIcon />
       </button>
     </div>
   )
 }
-
-// ─── UI: 풀스크린 버튼 (우하단, 자동숨김) ──────────────
 
 function FullscreenButton({ isFullscreen }: { isFullscreen: boolean }) {
   function onClick() {
@@ -806,7 +861,7 @@ function FullscreenButton({ isFullscreen }: { isFullscreen: boolean }) {
     else document.documentElement.requestFullscreen().catch(() => {})
   }
   return (
-    <button type="button" onClick={onClick} style={fsBtnStyle} title={isFullscreen ? '풀스크린 종료' : '풀스크린'}>
+    <button type="button" onClick={onClick} style={fsBtnStyle} title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}>
       {isFullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
     </button>
   )
@@ -821,7 +876,6 @@ function SparkleIcon() {
     </svg>
   )
 }
-
 function FullscreenEnterIcon() {
   return (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -832,7 +886,6 @@ function FullscreenEnterIcon() {
     </svg>
   )
 }
-
 function FullscreenExitIcon() {
   return (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -852,7 +905,6 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
     </div>
   )
 }
-
 function Toggle({ on, onClick, children }: { on: boolean; onClick: () => void; children: React.ReactNode }) {
   return <button type="button" onClick={onClick} style={toggleStyle(on)}>{children}</button>
 }
@@ -862,133 +914,62 @@ function Toggle({ on, onClick, children }: { on: boolean; onClick: () => void; c
 const containerStyle: React.CSSProperties = {
   position: 'fixed', inset: 0, background: '#000', overflow: 'hidden',
 }
-
 const canvasStyle: React.CSSProperties = {
   width: '100%', height: '100%', objectFit: 'cover', display: 'block',
 }
-
 const hiddenToggleStyle: React.CSSProperties = {
-  position: 'fixed',
-  top: 0,
-  left: 0,
-  width: 28,
-  height: 28,
-  background: 'transparent',
-  border: 'none',
-  cursor: 'pointer',
-  padding: 0,
-  zIndex: 11,
+  position: 'fixed', top: 0, left: 0, width: 28, height: 28,
+  background: 'transparent', border: 'none', cursor: 'pointer', padding: 0, zIndex: 11,
 }
-
 const statusOverlayStyle: React.CSSProperties = {
-  position: 'fixed',
-  top: 14,
-  left: 14,
-  zIndex: 10,
-  display: 'flex',
-  alignItems: 'center',
-  gap: 8,
-  fontSize: 13,
-  fontWeight: 600,
+  position: 'fixed', top: 14, left: 14, zIndex: 10,
+  display: 'flex', alignItems: 'center', gap: 8,
+  fontSize: 13, fontWeight: 600,
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-  color: '#fff',
-  textShadow: '0 1px 3px rgba(0,0,0,0.85)',
-  pointerEvents: 'none',
-  maxWidth: 'calc(100vw - 28px)',
+  color: '#fff', textShadow: '0 1px 3px rgba(0,0,0,0.85)',
+  pointerEvents: 'none', maxWidth: 'calc(100vw - 28px)',
 }
-
 const bottomWrapStyle: React.CSSProperties = {
-  position: 'fixed',
-  left: '50%',
-  bottom: 16,
-  transform: 'translateX(-50%)',
-  zIndex: 10,
-  display: 'flex',
-  flexDirection: 'column',
-  alignItems: 'center',
-  gap: 10,
-  maxWidth: 'calc(100vw - 28px)',
-  width: 'max-content',
+  position: 'fixed', left: '50%', bottom: 16, transform: 'translateX(-50%)',
+  zIndex: 10, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10,
+  maxWidth: 'calc(100vw - 28px)', width: 'max-content',
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-  color: '#fff',
-  textShadow: '0 1px 2px rgba(0,0,0,0.85)',
+  color: '#fff', textShadow: '0 1px 2px rgba(0,0,0,0.85)',
 }
-
 const panelStyle: React.CSSProperties = {
-  display: 'flex',
-  flexDirection: 'column',
-  gap: 8,
-  fontSize: 13,
-  maxWidth: 'min(560px, calc(100vw - 28px))',
-  alignItems: 'flex-start',
+  display: 'flex', flexDirection: 'column', gap: 8,
+  fontSize: 13, maxWidth: 'min(620px, calc(100vw - 28px))', alignItems: 'flex-start',
 }
-
 const rowStyle: React.CSSProperties = {
-  display: 'flex',
-  alignItems: 'center',
-  gap: 10,
-  flexWrap: 'wrap',
+  display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
 }
-
 const rowLabelStyle: React.CSSProperties = {
-  fontSize: 11,
-  opacity: 0.7,
-  letterSpacing: 0.5,
-  textTransform: 'uppercase',
-  minWidth: 60,
+  fontSize: 11, opacity: 0.7, letterSpacing: 0.5, textTransform: 'uppercase', minWidth: 70,
 }
-
 const rowChildrenStyle: React.CSSProperties = {
-  display: 'flex',
-  flexWrap: 'wrap',
-  gap: 6,
+  display: 'flex', flexWrap: 'wrap', gap: 6,
 }
-
 const toggleStyle = (on: boolean): React.CSSProperties => ({
   background: on ? 'rgba(126,238,238,0.18)' : 'rgba(255,255,255,0.04)',
   border: `1px solid ${on ? 'rgba(126,238,238,0.7)' : 'rgba(255,255,255,0.25)'}`,
-  color: '#fff',
-  padding: '4px 10px',
-  borderRadius: 6,
-  cursor: 'pointer',
-  fontSize: 12,
-  fontFamily: 'inherit',
-  textShadow: '0 1px 2px rgba(0,0,0,0.6)',
+  color: '#fff', padding: '4px 10px', borderRadius: 6, cursor: 'pointer',
+  fontSize: 12, fontFamily: 'inherit', textShadow: '0 1px 2px rgba(0,0,0,0.6)',
 })
-
 const fabStyle = (open: boolean): React.CSSProperties => ({
-  width: 48,
-  height: 48,
-  borderRadius: '50%',
+  width: 48, height: 48, borderRadius: '50%',
   border: `1px solid ${open ? 'rgba(126,238,238,0.7)' : 'rgba(255,255,255,0.4)'}`,
   background: open ? 'rgba(126,238,238,0.18)' : 'rgba(0,0,0,0.55)',
   backdropFilter: 'blur(8px)',
-  color: '#fff',
-  cursor: 'pointer',
-  padding: 0,
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
+  color: '#fff', cursor: 'pointer', padding: 0,
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
   boxShadow: open ? '0 0 16px rgba(126,238,238,0.5)' : '0 2px 8px rgba(0,0,0,0.5)',
 })
-
 const fsBtnStyle: React.CSSProperties = {
-  position: 'fixed',
-  right: 16,
-  bottom: 16,
-  zIndex: 11,
-  width: 42,
-  height: 42,
-  borderRadius: '50%',
+  position: 'fixed', right: 16, bottom: 16, zIndex: 11,
+  width: 42, height: 42, borderRadius: '50%',
   border: '1px solid rgba(255,255,255,0.4)',
-  background: 'rgba(0,0,0,0.55)',
-  backdropFilter: 'blur(8px)',
-  color: '#fff',
-  cursor: 'pointer',
-  padding: 0,
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  boxShadow: '0 2px 8px rgba(0,0,0,0.5)',
-  transition: 'opacity 200ms',
+  background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(8px)',
+  color: '#fff', cursor: 'pointer', padding: 0,
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  boxShadow: '0 2px 8px rgba(0,0,0,0.5)', transition: 'opacity 200ms',
 }
