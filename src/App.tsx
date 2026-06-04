@@ -21,16 +21,18 @@ const SCORE_THRESHOLD = 0.45
 const POSITION_ALPHA = 0.35
 const SCORE_ALPHA = 0.15
 const ENTRY_ANIM_MS = 600
+const SPOTIFY_ENTRY_MS = 700
 const PALM_PROXIMITY_RATIO = 0.6
 const STILLNESS_DWELL_MS = 1500
 const STILLNESS_MOVE_PX = 25
-const EVADE_INFLUENCE_PX = 200    // 손이 이 거리 안일 때 효과가 도망
-const EVADE_MAX_OFFSET_PX = 90    // 최대 도망 거리
+const EVADE_INFLUENCE_PX = 200
+const EVADE_MAX_OFFSET_PX = 90
+const FS_UI_HIDE_MS = 3000
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 type BBox = { x: number; y: number; w: number; h: number }
-type EffectType = 'spotify' | 'halo' | 'sequence' | 'ring' | 'particles'
-type ShapeMode = 'box' | 'silhouette-bg' | 'silhouette-fg'
+type EffectType = 'none' | 'spotify' | 'halo' | 'sequence' | 'ring' | 'particles'
+type ShapeMode = 'none' | 'box' | 'silhouette-bg' | 'silhouette-fg'
 type InteractionMode = 'none' | 'palm-hide' | 'stillness-boost' | 'jump-grow' | 'evade'
 
 type Track = {
@@ -38,6 +40,7 @@ type Track = {
   bbox: BBox
   score: number
   firstSeenAt: number
+  effectStartedAt: number
   lastSeenAt: number
   effectVisibility: number
   lastCenter: { x: number; y: number; ts: number }
@@ -56,24 +59,24 @@ export default function App() {
 
   const [status, setStatus] = useState<Status>('idle')
   const [errorMsg, setErrorMsg] = useState('')
-  const [mirror, setMirror] = useState(true)
-  const [showOverlay, setShowOverlay] = useState(true)
   const [panelOpen, setPanelOpen] = useState(false)
   const [fps, setFps] = useState(0)
   const [trackCount, setTrackCount] = useState(0)
-  const [effect, setEffect] = useState<EffectType>('spotify')
-  const [shape, setShape] = useState<ShapeMode>('box')
+  const [effect, setEffectState] = useState<EffectType>('none')
+  const [shape, setShape] = useState<ShapeMode>('none')
   const [interaction, setInteraction] = useState<InteractionMode>('none')
+  const [statusVisible, setStatusVisible] = useState(false)
+  const [fsUiVisible, setFsUiVisible] = useState(true)
+  const [isFullscreen, setIsFullscreen] = useState(false)
 
+  // 거울은 항상 ON으로 고정
+  const mirrorRef = useRef(true)
+  const showOverlayRef = useRef(true)
   const refs = {
-    mirror: useRef(mirror),
-    showOverlay: useRef(showOverlay),
     effect: useRef(effect),
     shape: useRef(shape),
     interaction: useRef(interaction),
   }
-  useEffect(() => { refs.mirror.current = mirror }, [mirror])
-  useEffect(() => { refs.showOverlay.current = showOverlay }, [showOverlay])
   useEffect(() => { refs.effect.current = effect }, [effect])
   useEffect(() => { refs.shape.current = shape }, [shape])
   useEffect(() => { refs.interaction.current = interaction }, [interaction])
@@ -83,31 +86,38 @@ export default function App() {
   const lastGestureRef = useRef<GestureRecognizerResult | null>(null)
   const lastSegMaskRef = useRef<ImageSegmenterResult | null>(null)
 
-  // 단축키 (e.code 기반 — 한글 IME OK)
+  // 효과 변경 시 모든 트랙의 등장 애니 재시작
+  function setEffect(next: EffectType) {
+    const now = performance.now()
+    for (const t of tracksRef.current) t.effectStartedAt = now
+    setEffectState(next)
+  }
+
+  // 마우스/터치 움직임 감지 → 풀스크린 UI 자동 숨김
   useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
-      switch (e.code) {
-        case 'KeyD': setPanelOpen((v) => !v); break
-        case 'KeyM': setMirror((v) => !v); break
-        case 'KeyO': setShowOverlay((v) => !v); break
-        case 'KeyF': toggleFullscreen(); break
-        case 'KeyB': setShape('box'); break
-        case 'KeyS': setShape((s) => s === 'silhouette-bg' ? 'silhouette-fg' : 'silhouette-bg'); break
-        case 'Digit1': setEffect('spotify'); break
-        case 'Digit2': setEffect('halo'); break
-        case 'Digit3': setEffect('sequence'); break
-        case 'Digit4': setEffect('ring'); break
-        case 'Digit5': setEffect('particles'); break
-        case 'KeyN': setInteraction('none'); break
-        case 'KeyP': setInteraction('palm-hide'); break
-        case 'KeyT': setInteraction('stillness-boost'); break
-        case 'KeyJ': setInteraction('jump-grow'); break
-        case 'KeyE': setInteraction('evade'); break
-      }
+    let timer: ReturnType<typeof setTimeout> | null = null
+    function show() {
+      setFsUiVisible(true)
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => setFsUiVisible(false), FS_UI_HIDE_MS)
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    window.addEventListener('mousemove', show)
+    window.addEventListener('touchstart', show)
+    window.addEventListener('pointerdown', show)
+    show()
+    return () => {
+      window.removeEventListener('mousemove', show)
+      window.removeEventListener('touchstart', show)
+      window.removeEventListener('pointerdown', show)
+      if (timer) clearTimeout(timer)
+    }
+  }, [])
+
+  // 풀스크린 상태 추적
+  useEffect(() => {
+    function onChange() { setIsFullscreen(!!document.fullscreenElement) }
+    document.addEventListener('fullscreenchange', onChange)
+    return () => document.removeEventListener('fullscreenchange', onChange)
   }, [])
 
   useEffect(() => {
@@ -153,10 +163,7 @@ export default function App() {
           video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
           audio: false,
         })
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop())
-          return
-        }
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return }
         const video = videoRef.current!
         video.srcObject = stream
         await video.play()
@@ -216,7 +223,7 @@ export default function App() {
     if (canvas.height !== vh) canvas.height = vh
 
     const ctx = canvas.getContext('2d')!
-    const mirrored = refs.mirror.current
+    const mirrored = mirrorRef.current
 
     ctx.save()
     if (mirrored) { ctx.translate(vw, 0); ctx.scale(-1, 1) }
@@ -239,35 +246,33 @@ export default function App() {
     updateTracks(tracksRef.current, detections, ts, nextIdRef)
     if (tracksRef.current.length !== trackCount) setTrackCount(tracksRef.current.length)
 
-    // ─── Gesture (인터랙션용)
+    // ─── Gesture
     let gestureResult: GestureRecognizerResult | undefined
     try { gestureResult = gesture.recognizeForVideo(video, ts) } catch { /* skip */ }
     if (gestureResult) lastGestureRef.current = gestureResult
 
-    applyInteraction(tracksRef.current, lastGestureRef.current, refs.interaction.current, vw, vh, ts)
+    applyInteraction(tracksRef.current, lastGestureRef.current, refs.interaction.current, vw, vh, ts, refs.effect.current)
 
-    // ─── Silhouette (선택 모드에서만)
+    // ─── 표시
     const shapeMode = refs.shape.current
     if (shapeMode === 'silhouette-bg' || shapeMode === 'silhouette-fg') {
       try {
         const seg = segmenter.segmentForVideo(video, ts)
         if (seg) lastSegMaskRef.current = seg
       } catch { /* skip */ }
-    }
-
-    // ─── 표시 (디버그 시각화)
-    if (shapeMode === 'silhouette-bg' && lastSegMaskRef.current) {
-      drawSilhouette(ctx, lastSegMaskRef.current, vw, vh, mirrored, 'bg')
-    }
-    if (shapeMode === 'silhouette-fg' && lastSegMaskRef.current) {
-      drawSilhouette(ctx, lastSegMaskRef.current, vw, vh, mirrored, 'fg')
+      if (lastSegMaskRef.current) {
+        drawSilhouette(ctx, lastSegMaskRef.current, vw, vh, mirrored, shapeMode === 'silhouette-bg' ? 'bg' : 'fg')
+      }
     }
     if (shapeMode === 'box') {
-      for (const t of tracksRef.current) drawDebugBox(ctx, t, vw, mirrored)
+      for (const t of tracksRef.current) drawBBox(ctx, t, vw, mirrored)
+    }
+    if (shapeMode !== 'none') {
+      for (const t of tracksRef.current) drawHeadLabel(ctx, t, vw, mirrored)
     }
 
     // ─── 효과 렌더
-    if (refs.showOverlay.current) {
+    if (showOverlayRef.current && refs.effect.current !== 'none') {
       const fxType = refs.effect.current
       for (const t of tracksRef.current) {
         if (t.effectVisibility <= 0.01) continue
@@ -281,22 +286,31 @@ export default function App() {
       <video ref={videoRef} playsInline muted style={{ display: 'none' }} />
       <canvas ref={canvasRef} style={canvasStyle} />
 
-      <StatusOverlay status={status} errorMsg={errorMsg} fps={fps} trackCount={trackCount} />
+      <button
+        type="button"
+        onClick={() => setStatusVisible((v) => !v)}
+        style={hiddenToggleStyle}
+        title="상태 토글"
+        aria-label="상태 토글"
+      />
+      {statusVisible && (
+        <StatusOverlay status={status} errorMsg={errorMsg} fps={fps} trackCount={trackCount} />
+      )}
 
       <BottomPanel
         open={panelOpen}
         toggle={() => setPanelOpen((v) => !v)}
-        mirror={mirror}
-        showOverlay={showOverlay}
         effect={effect}
         shape={shape}
         interaction={interaction}
-        setMirror={setMirror}
-        setShowOverlay={setShowOverlay}
         setEffect={setEffect}
         setShape={setShape}
         setInteraction={setInteraction}
       />
+
+      {fsUiVisible && (
+        <FullscreenButton isFullscreen={isFullscreen} />
+      )}
     </div>
   )
 }
@@ -339,6 +353,7 @@ function updateTracks(
       bbox: det.bbox,
       score: det.score,
       firstSeenAt: now,
+      effectStartedAt: now,
       lastSeenAt: now,
       effectVisibility: 0,
       lastCenter: { x: det.bbox.x + det.bbox.w / 2, y: det.bbox.y + det.bbox.h / 2, ts: now },
@@ -366,6 +381,25 @@ function lerp(a: number, b: number, t: number): number { return a + (b - a) * t 
 function clamp(v: number, lo: number, hi: number): number { return Math.max(lo, Math.min(hi, v)) }
 function easeOut(t: number): number { return 1 - Math.pow(1 - t, 3) }
 
+// ─── 효과 위치 계산 (인터랙션과 렌더에서 공유) ──────────
+
+function effectAnchor(t: Track, fx: EffectType) {
+  const headSize = Math.max(40, t.bbox.w * 0.35)
+  if (fx === 'spotify') {
+    // 머리 우상단 옆, 얼굴 안 가리는 위치
+    return {
+      cx: t.bbox.x + t.bbox.w / 2 + headSize * 0.85,
+      cy: t.bbox.y + headSize * 0.35,
+      headSize,
+    }
+  }
+  return {
+    cx: t.bbox.x + t.bbox.w / 2,
+    cy: t.bbox.y + headSize * 0.5,
+    headSize,
+  }
+}
+
 // ─── 상호작용 ───────────────────────────────────────────
 
 function applyInteraction(
@@ -375,6 +409,7 @@ function applyInteraction(
   vw: number,
   vh: number,
   now: number,
+  effect: EffectType,
 ) {
   for (const t of tracks) {
     const age = now - t.firstSeenAt
@@ -382,7 +417,6 @@ function applyInteraction(
     const entryVis = easeOut(entryFactor)
     let targetVis = entryVis
 
-    // 모션 추적
     const cx = t.bbox.x + t.bbox.w / 2
     const cy = t.bbox.y + t.bbox.h / 2
     const dt = now - t.lastCenter.ts
@@ -399,7 +433,6 @@ function applyInteraction(
     }
     t.prevTopY = t.bbox.y
 
-    // 모드별 처리
     let evadeTargetX = 0, evadeTargetY = 0
 
     if (mode === 'palm-hide' && gesture) {
@@ -408,10 +441,9 @@ function applyInteraction(
       if (t.stillSince !== null && now - t.stillSince > STILLNESS_DWELL_MS) targetVis = entryVis
       else targetVis = entryVis * 0.45
     } else if (mode === 'evade' && gesture && gesture.landmarks) {
-      // 효과 위치(머리 부근) 계산
-      const headSize = Math.max(40, t.bbox.w * 0.35)
-      const fxCx = t.bbox.x + t.bbox.w / 2 + t.evadeOffset.x
-      const fxCy = t.bbox.y + headSize * 0.5 + t.evadeOffset.y
+      const anchor = effectAnchor(t, effect)
+      const fxCx = anchor.cx + t.evadeOffset.x
+      const fxCy = anchor.cy + t.evadeOffset.y
       let totalX = 0, totalY = 0
       for (const lm of gesture.landmarks) {
         if (!lm?.length) continue
@@ -433,11 +465,9 @@ function applyInteraction(
       evadeTargetY = totalY
     }
 
-    // 가시성 스프링
     const visK = mode === 'palm-hide' ? 0.27 : 0.13
     t.effectVisibility = lerp(t.effectVisibility, targetVis, visK)
 
-    // evade 오프셋 스프링 (push 강할 땐 빠르게, 복귀는 부드럽게)
     const evadeK = (evadeTargetX !== 0 || evadeTargetY !== 0) ? 0.3 : 0.12
     t.evadeOffset.x = lerp(t.evadeOffset.x, evadeTargetX, evadeK)
     t.evadeOffset.y = lerp(t.evadeOffset.y, evadeTargetY, evadeK)
@@ -462,7 +492,7 @@ function palmCloseToTrack(g: GestureRecognizerResult, bbox: BBox, vw: number, vh
   return false
 }
 
-// ─── 효과 ───────────────────────────────────────────────
+// ─── 효과 렌더 ──────────────────────────────────────────
 
 function drawEffect(
   ctx: CanvasRenderingContext2D,
@@ -472,72 +502,67 @@ function drawEffect(
   mirrored: boolean,
   fx: EffectType,
 ) {
-  const headSize = Math.max(40, t.bbox.w * 0.35)
-  let cx = t.bbox.x + t.bbox.w / 2 + t.evadeOffset.x
-  const cy = t.bbox.y + headSize * 0.5 + t.evadeOffset.y
+  const anchor = effectAnchor(t, fx)
+  let cx = anchor.cx + t.evadeOffset.x
+  const cy = anchor.cy + t.evadeOffset.y
   if (mirrored) cx = vw - cx
 
-  const age = ts - t.firstSeenAt
   const jumpScale = 1 + t.jumpBoost * 0.6
-  let scale = lerp(0.5, 1.0, t.effectVisibility) * jumpScale
 
-  // spotify는 뽀잉 스프링 등장
   if (fx === 'spotify') {
-    const tt = clamp(age / 700, 0, 1)
-    const overshoot = Math.sin(tt * Math.PI * 2.3) * Math.exp(-tt * 3.5) * 0.4
-    scale = (easeOut(tt) + overshoot) * jumpScale * t.effectVisibility
+    const age = ts - t.effectStartedAt
+    const tt = clamp(age / SPOTIFY_ENTRY_MS, 0, 1)
+    const overshoot = Math.sin(tt * Math.PI * 2.3) * Math.exp(-tt * 3.2) * 0.5
+    const entryScale = clamp(easeOut(tt) + overshoot, 0, 1.5)
+    const r = anchor.headSize * 0.5 * entryScale * jumpScale * t.effectVisibility
+    if (r < 0.5) return
+    ctx.save()
+    ctx.globalAlpha *= t.effectVisibility
+    drawSpotifyLogo(ctx, cx, cy, r)
+    ctx.restore()
+    return
   }
+
+  const scale = lerp(0.5, 1.0, t.effectVisibility) * jumpScale
 
   ctx.save()
   ctx.globalAlpha *= t.effectVisibility
-
+  ctx.globalCompositeOperation = 'screen'
   switch (fx) {
-    case 'spotify':
-      drawSpotifyLogo(ctx, cx, cy, headSize * 1.0 * Math.max(0.01, scale))
-      break
-    case 'halo':
-      ctx.globalCompositeOperation = 'screen'
-      drawHalo(ctx, cx, cy, headSize * 1.1 * scale)
-      break
-    case 'sequence':
-      ctx.globalCompositeOperation = 'screen'
-      drawSequenceFrame(ctx, cx, cy, headSize * 1.3 * scale, ts, t.id)
-      break
-    case 'ring':
-      ctx.globalCompositeOperation = 'screen'
-      drawRing(ctx, cx, cy, headSize * 1.2 * scale, ts, t.id)
-      break
-    case 'particles':
-      ctx.globalCompositeOperation = 'screen'
-      drawParticles(ctx, cx, cy, headSize * 1.4 * scale, ts, t.id)
-      break
+    case 'halo':      drawHalo(ctx, cx, cy, anchor.headSize * 1.1 * scale); break
+    case 'sequence':  drawSequenceFrame(ctx, cx, cy, anchor.headSize * 1.3 * scale, ts, t.id); break
+    case 'ring':      drawRing(ctx, cx, cy, anchor.headSize * 1.2 * scale, ts, t.id); break
+    case 'particles': drawParticles(ctx, cx, cy, anchor.headSize * 1.4 * scale, ts, t.id); break
   }
   ctx.restore()
 }
 
-// Spotify 로고 — 코드로 그리기 (PoC; 상업 사용 시 브랜드 가이드라인 준수 필요)
 function drawSpotifyLogo(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number) {
   if (r < 1) return
-  // 초록 원
+  // 그림자
+  ctx.shadowColor = 'rgba(0,0,0,0.4)'
+  ctx.shadowBlur = r * 0.4
+  ctx.shadowOffsetY = r * 0.08
+
   ctx.fillStyle = '#1DB954'
   ctx.beginPath()
   ctx.arc(cx, cy, r, 0, Math.PI * 2)
   ctx.fill()
+  ctx.shadowBlur = 0
+  ctx.shadowOffsetY = 0
 
-  // 흰 곡선 3줄 (위→아래 갈수록 좁게, 굵기는 비슷)
   ctx.strokeStyle = '#fff'
   ctx.lineCap = 'round'
-  const offsets = [
-    { yo: -r * 0.30, rad: r * 0.78, lw: r * 0.16 },
-    { yo: -r * 0.08, rad: r * 0.60, lw: r * 0.13 },
-    { yo:  r * 0.14, rad: r * 0.42, lw: r * 0.11 },
+  const bars = [
+    { yo: -r * 0.30, rad: r * 0.78, lw: r * 0.18 },
+    { yo: -r * 0.08, rad: r * 0.60, lw: r * 0.15 },
+    { yo:  r * 0.14, rad: r * 0.42, lw: r * 0.12 },
   ]
-  for (const o of offsets) {
-    ctx.lineWidth = o.lw
+  for (const b of bars) {
+    ctx.lineWidth = b.lw
     ctx.beginPath()
-    // 아래쪽으로 볼록한 호: 좌->우, 시작 각 ~ 200°, 끝 각 ~ 340° (정상 좌표계 기준 아래쪽)
-    const yCenter = cy + o.yo + o.rad * 0.55
-    ctx.arc(cx, yCenter, o.rad, Math.PI * 1.18, Math.PI * 1.82)
+    const yCenter = cy + b.yo + b.rad * 0.55
+    ctx.arc(cx, yCenter, b.rad, Math.PI * 1.18, Math.PI * 1.82)
     ctx.stroke()
   }
 }
@@ -548,9 +573,7 @@ function drawHalo(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: numb
   grad.addColorStop(0.45, 'rgba(255, 170, 60, 0.5)')
   grad.addColorStop(1, 'rgba(255, 80, 0, 0)')
   ctx.fillStyle = grad
-  ctx.beginPath()
-  ctx.arc(cx, cy, r, 0, Math.PI * 2)
-  ctx.fill()
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill()
 }
 
 function drawSequenceFrame(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, ts: number, seed: number) {
@@ -607,9 +630,9 @@ function drawParticles(ctx: CanvasRenderingContext2D, cx: number, cy: number, r:
   }
 }
 
-// ─── 시각화: 박스 / 윤곽 ────────────────────────────────
+// ─── 시각화: 박스 / 윤곽 / 라벨 ─────────────────────────
 
-function drawDebugBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirrored: boolean) {
+function drawBBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirrored: boolean) {
   let x = t.bbox.x
   if (mirrored) x = vw - t.bbox.x - t.bbox.w
   const { y, w, h } = t.bbox
@@ -618,11 +641,33 @@ function drawDebugBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirro
   ctx.strokeStyle = color
   ctx.lineWidth = 3
   ctx.strokeRect(x, y, w, h)
-  ctx.fillStyle = color
-  ctx.font = 'bold 16px ui-monospace, Menlo, monospace'
-  ctx.textBaseline = 'bottom'
+  ctx.restore()
+}
+
+function drawHeadLabel(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirrored: boolean) {
+  let cx = t.bbox.x + t.bbox.w / 2
+  if (mirrored) cx = vw - cx
+  const yTop = Math.max(28, t.bbox.y)
+  const color = colorForId(t.id)
   const label = `#${t.id}  ${(t.score * 100).toFixed(0)}%`
-  ctx.fillText(label, x + 4, Math.max(16, y - 4))
+
+  ctx.save()
+  ctx.font = 'bold 18px ui-monospace, Menlo, monospace'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'bottom'
+  const textW = ctx.measureText(label).width
+  const padX = 10
+  const padY = 4
+  const labelH = 26
+  const bx = cx - textW / 2 - padX
+  const by = yTop - labelH - 6
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.78)'
+  ctx.fillRect(bx, by, textW + padX * 2, labelH)
+  ctx.strokeStyle = color
+  ctx.lineWidth = 1.5
+  ctx.strokeRect(bx, by, textW + padX * 2, labelH)
+  ctx.fillStyle = color
+  ctx.fillText(label, cx, by + labelH - padY)
   ctx.restore()
 }
 
@@ -643,9 +688,6 @@ function drawSilhouette(
   off.width = w; off.height = h
   const offCtx = off.getContext('2d')!
   const img = offCtx.createImageData(w, h)
-
-  // selfie_segmenter는 일반적으로 person 영역에 작은 값, 배경에 큰 값 (또는 반대)
-  // 두 모드 모두 지원: 'bg'는 v===0 영역 컬러, 'fg'는 v!==0 영역 컬러
   const targetIsZero = side === 'bg'
   const baseR = side === 'bg' ? 0 : 255
   const baseG = side === 'bg' ? 255 : 120
@@ -667,8 +709,6 @@ function drawSilhouette(
   if (mirrored) { ctx.translate(vw, 0); ctx.scale(-1, 1) }
   ctx.globalCompositeOperation = 'screen'
   ctx.drawImage(off, 0, 0, vw, vh)
-
-  // fg 모드는 외곽선 강조 — 살짝 확대 후 stroke 효과
   if (side === 'fg') {
     ctx.globalCompositeOperation = 'source-over'
     ctx.shadowColor = `rgba(${baseR}, ${baseG}, ${baseB}, 0.9)`
@@ -682,16 +722,16 @@ function drawSilhouette(
 const COLORS = ['#7ee', '#ff7', '#f7f', '#7f7', '#f77', '#77f', '#fa7', '#7fa', '#a7f', '#f7a']
 function colorForId(id: number): string { return COLORS[id % COLORS.length] }
 
-// ─── UI: 좌상단 상태 ────────────────────────────────────
+// ─── UI: 좌상단 상태 (텍스트만, 이모지 X) ───────────────
 
 function StatusOverlay(props: { status: Status; errorMsg: string; fps: number; trackCount: number }) {
   const { status, errorMsg, fps, trackCount } = props
   const label: Record<Status, string> = {
-    idle: '⚪ idle',
-    'loading-model': '⏳ 모델 로딩…',
-    'requesting-camera': '📷 카메라…',
-    running: '🟢 running',
-    error: '🔴 error',
+    idle: 'idle',
+    'loading-model': 'loading model',
+    'requesting-camera': 'requesting camera',
+    running: 'running',
+    error: 'error',
   }
   const fpsColor = fps >= 50 ? '#7ee' : fps >= 30 ? '#ff7' : '#f77'
   return (
@@ -702,7 +742,7 @@ function StatusOverlay(props: { status: Status; errorMsg: string; fps: number; t
           <span style={{ opacity: 0.4 }}>·</span>
           <span style={{ color: fpsColor }}>{fps} fps</span>
           <span style={{ opacity: 0.4 }}>·</span>
-          <span>👥 {trackCount}</span>
+          <span>{trackCount} tracked</span>
         </>
       )}
       {status === 'error' && <span style={{ color: '#f77', marginLeft: 6 }}>{errorMsg}</span>}
@@ -715,54 +755,60 @@ function StatusOverlay(props: { status: Status; errorMsg: string; fps: number; t
 function BottomPanel(props: {
   open: boolean
   toggle: () => void
-  mirror: boolean
-  showOverlay: boolean
   effect: EffectType
   shape: ShapeMode
   interaction: InteractionMode
-  setMirror: React.Dispatch<React.SetStateAction<boolean>>
-  setShowOverlay: React.Dispatch<React.SetStateAction<boolean>>
-  setEffect: React.Dispatch<React.SetStateAction<EffectType>>
+  setEffect: (e: EffectType) => void
   setShape: React.Dispatch<React.SetStateAction<ShapeMode>>
   setInteraction: React.Dispatch<React.SetStateAction<InteractionMode>>
 }) {
-  const { open, toggle, mirror, showOverlay, effect, shape, interaction,
-    setMirror, setShowOverlay, setEffect, setShape, setInteraction } = props
+  const { open, toggle, effect, shape, interaction, setEffect, setShape, setInteraction } = props
 
   return (
     <div style={bottomWrapStyle}>
       {open && (
         <div style={panelStyle}>
-          <Row label="모드">
-            <Toggle on={mirror} onClick={() => setMirror((v) => !v)}>거울 <K>M</K></Toggle>
-            <Toggle on={showOverlay} onClick={() => setShowOverlay((v) => !v)}>효과 <K>O</K></Toggle>
-            <Toggle on={false} onClick={toggleFullscreen}>풀스크린 <K>F</K></Toggle>
-          </Row>
           <Row label="표시">
-            <Toggle on={shape === 'box'} onClick={() => setShape('box')}>박스 <K>B</K></Toggle>
-            <Toggle on={shape === 'silhouette-bg'} onClick={() => setShape('silhouette-bg')}>윤곽-배경 <K>S</K></Toggle>
-            <Toggle on={shape === 'silhouette-fg'} onClick={() => setShape('silhouette-fg')}>윤곽-사람 <K>S</K></Toggle>
+            <Toggle on={shape === 'none'} onClick={() => setShape('none')}>없음</Toggle>
+            <Toggle on={shape === 'box'} onClick={() => setShape('box')}>박스</Toggle>
+            <Toggle on={shape === 'silhouette-bg'} onClick={() => setShape('silhouette-bg')}>윤곽-배경</Toggle>
+            <Toggle on={shape === 'silhouette-fg'} onClick={() => setShape('silhouette-fg')}>윤곽-사람</Toggle>
           </Row>
           <Row label="효과">
-            <Toggle on={effect === 'spotify'} onClick={() => setEffect('spotify')}>spotify <K>1</K></Toggle>
-            <Toggle on={effect === 'halo'} onClick={() => setEffect('halo')}>halo <K>2</K></Toggle>
-            <Toggle on={effect === 'sequence'} onClick={() => setEffect('sequence')}>시퀀스 <K>3</K></Toggle>
-            <Toggle on={effect === 'ring'} onClick={() => setEffect('ring')}>ring <K>4</K></Toggle>
-            <Toggle on={effect === 'particles'} onClick={() => setEffect('particles')}>파티클 <K>5</K></Toggle>
+            <Toggle on={effect === 'none'} onClick={() => setEffect('none')}>없음</Toggle>
+            <Toggle on={effect === 'spotify'} onClick={() => setEffect('spotify')}>spotify</Toggle>
+            <Toggle on={effect === 'halo'} onClick={() => setEffect('halo')}>halo</Toggle>
+            <Toggle on={effect === 'sequence'} onClick={() => setEffect('sequence')}>시퀀스</Toggle>
+            <Toggle on={effect === 'ring'} onClick={() => setEffect('ring')}>ring</Toggle>
+            <Toggle on={effect === 'particles'} onClick={() => setEffect('particles')}>파티클</Toggle>
           </Row>
           <Row label="상호작용">
-            <Toggle on={interaction === 'none'} onClick={() => setInteraction('none')}>없음 <K>N</K></Toggle>
-            <Toggle on={interaction === 'palm-hide'} onClick={() => setInteraction('palm-hide')}>손바닥숨김 <K>P</K></Toggle>
-            <Toggle on={interaction === 'stillness-boost'} onClick={() => setInteraction('stillness-boost')}>정지강화 <K>T</K></Toggle>
-            <Toggle on={interaction === 'jump-grow'} onClick={() => setInteraction('jump-grow')}>점프확대 <K>J</K></Toggle>
-            <Toggle on={interaction === 'evade'} onClick={() => setInteraction('evade')}>도망 <K>E</K></Toggle>
+            <Toggle on={interaction === 'none'} onClick={() => setInteraction('none')}>없음</Toggle>
+            <Toggle on={interaction === 'palm-hide'} onClick={() => setInteraction('palm-hide')}>손바닥숨김</Toggle>
+            <Toggle on={interaction === 'stillness-boost'} onClick={() => setInteraction('stillness-boost')}>정지강화</Toggle>
+            <Toggle on={interaction === 'jump-grow'} onClick={() => setInteraction('jump-grow')}>점프확대</Toggle>
+            <Toggle on={interaction === 'evade'} onClick={() => setInteraction('evade')}>도망</Toggle>
           </Row>
         </div>
       )}
-      <button type="button" onClick={toggle} title="효과 패널 (D)" style={fabStyle(open)}>
+      <button type="button" onClick={toggle} title="효과 패널" style={fabStyle(open)}>
         <SparkleIcon />
       </button>
     </div>
+  )
+}
+
+// ─── UI: 풀스크린 버튼 (우하단, 자동숨김) ──────────────
+
+function FullscreenButton({ isFullscreen }: { isFullscreen: boolean }) {
+  function onClick() {
+    if (isFullscreen) document.exitFullscreen().catch(() => {})
+    else document.documentElement.requestFullscreen().catch(() => {})
+  }
+  return (
+    <button type="button" onClick={onClick} style={fsBtnStyle} title={isFullscreen ? '풀스크린 종료' : '풀스크린'}>
+      {isFullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
+    </button>
   )
 }
 
@@ -772,6 +818,28 @@ function SparkleIcon() {
       <path d="M12 3 L13.5 9 L20 10.5 L13.5 12 L12 18 L10.5 12 L4 10.5 L10.5 9 Z" />
       <path d="M19 17 L19.7 19 L22 19.7 L19.7 20.4 L19 22.5 L18.3 20.4 L16 19.7 L18.3 19 Z" />
       <path d="M5 15 L5.5 16.5 L7 17 L5.5 17.5 L5 19 L4.5 17.5 L3 17 L4.5 16.5 Z" />
+    </svg>
+  )
+}
+
+function FullscreenEnterIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M4 9 V4 H9" />
+      <path d="M20 9 V4 H15" />
+      <path d="M4 15 V20 H9" />
+      <path d="M20 15 V20 H15" />
+    </svg>
+  )
+}
+
+function FullscreenExitIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M9 4 V9 H4" />
+      <path d="M15 4 V9 H20" />
+      <path d="M9 20 V15 H4" />
+      <path d="M15 20 V15 H20" />
     </svg>
   )
 }
@@ -789,15 +857,6 @@ function Toggle({ on, onClick, children }: { on: boolean; onClick: () => void; c
   return <button type="button" onClick={onClick} style={toggleStyle(on)}>{children}</button>
 }
 
-function K({ children }: { children: React.ReactNode }) {
-  return <kbd style={kbdStyle}>{children}</kbd>
-}
-
-function toggleFullscreen() {
-  if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {})
-  else document.exitFullscreen().catch(() => {})
-}
-
 // ─── 스타일 ─────────────────────────────────────────────
 
 const containerStyle: React.CSSProperties = {
@@ -806,6 +865,19 @@ const containerStyle: React.CSSProperties = {
 
 const canvasStyle: React.CSSProperties = {
   width: '100%', height: '100%', objectFit: 'cover', display: 'block',
+}
+
+const hiddenToggleStyle: React.CSSProperties = {
+  position: 'fixed',
+  top: 0,
+  left: 0,
+  width: 28,
+  height: 28,
+  background: 'transparent',
+  border: 'none',
+  cursor: 'pointer',
+  padding: 0,
+  zIndex: 11,
 }
 
 const statusOverlayStyle: React.CSSProperties = {
@@ -856,7 +928,6 @@ const rowStyle: React.CSSProperties = {
   alignItems: 'center',
   gap: 10,
   flexWrap: 'wrap',
-  justifyContent: 'flex-start',
 }
 
 const rowLabelStyle: React.CSSProperties = {
@@ -877,26 +948,13 @@ const toggleStyle = (on: boolean): React.CSSProperties => ({
   background: on ? 'rgba(126,238,238,0.18)' : 'rgba(255,255,255,0.04)',
   border: `1px solid ${on ? 'rgba(126,238,238,0.7)' : 'rgba(255,255,255,0.25)'}`,
   color: '#fff',
-  padding: '4px 8px',
+  padding: '4px 10px',
   borderRadius: 6,
   cursor: 'pointer',
   fontSize: 12,
   fontFamily: 'inherit',
-  display: 'inline-flex',
-  alignItems: 'center',
-  gap: 5,
   textShadow: '0 1px 2px rgba(0,0,0,0.6)',
 })
-
-const kbdStyle: React.CSSProperties = {
-  background: 'rgba(0,0,0,0.5)',
-  border: '1px solid rgba(255,255,255,0.25)',
-  borderRadius: 3,
-  padding: '0 4px',
-  fontSize: 10,
-  fontFamily: 'inherit',
-  textShadow: 'none',
-}
 
 const fabStyle = (open: boolean): React.CSSProperties => ({
   width: 48,
@@ -913,3 +971,24 @@ const fabStyle = (open: boolean): React.CSSProperties => ({
   justifyContent: 'center',
   boxShadow: open ? '0 0 16px rgba(126,238,238,0.5)' : '0 2px 8px rgba(0,0,0,0.5)',
 })
+
+const fsBtnStyle: React.CSSProperties = {
+  position: 'fixed',
+  right: 16,
+  bottom: 16,
+  zIndex: 11,
+  width: 42,
+  height: 42,
+  borderRadius: '50%',
+  border: '1px solid rgba(255,255,255,0.4)',
+  background: 'rgba(0,0,0,0.55)',
+  backdropFilter: 'blur(8px)',
+  color: '#fff',
+  cursor: 'pointer',
+  padding: 0,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  boxShadow: '0 2px 8px rgba(0,0,0,0.5)',
+  transition: 'opacity 200ms',
+}
