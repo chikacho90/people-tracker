@@ -20,16 +20,18 @@ const TRACK_MATCH_IOU = 0.2
 const SCORE_THRESHOLD = 0.45
 const POSITION_ALPHA = 0.35
 const SCORE_ALPHA = 0.15
-const ENTRY_ANIM_MS = 600         // 트랙 첫 등장 시 페이드인 + 스케일업
-const PALM_PROXIMITY_RATIO = 0.6  // 손 → 트랙 bbox 중심 거리 임계 (bbox 너비 대비)
-const STILLNESS_DWELL_MS = 1500   // 정지 판단 임계
-const STILLNESS_MOVE_PX = 25      // 이만큼 안 움직이면 정지
+const ENTRY_ANIM_MS = 600
+const PALM_PROXIMITY_RATIO = 0.6
+const STILLNESS_DWELL_MS = 1500
+const STILLNESS_MOVE_PX = 25
+const EVADE_INFLUENCE_PX = 200    // 손이 이 거리 안일 때 효과가 도망
+const EVADE_MAX_OFFSET_PX = 90    // 최대 도망 거리
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 type BBox = { x: number; y: number; w: number; h: number }
-type EffectType = 'halo' | 'sequence' | 'ring' | 'particles'
-type ShapeMode = 'box' | 'silhouette'
-type InteractionMode = 'none' | 'palm-hide' | 'stillness-boost' | 'jump-grow'
+type EffectType = 'spotify' | 'halo' | 'sequence' | 'ring' | 'particles'
+type ShapeMode = 'box' | 'silhouette-bg' | 'silhouette-fg'
+type InteractionMode = 'none' | 'palm-hide' | 'stillness-boost' | 'jump-grow' | 'evade'
 
 type Track = {
   id: number
@@ -37,11 +39,12 @@ type Track = {
   score: number
   firstSeenAt: number
   lastSeenAt: number
-  effectVisibility: number    // 0..1 — 상호작용 모드에서 사용
+  effectVisibility: number
   lastCenter: { x: number; y: number; ts: number }
   stillSince: number | null
   prevTopY: number | null
-  jumpBoost: number           // 0..1
+  jumpBoost: number
+  evadeOffset: { x: number; y: number }
 }
 
 export default function App() {
@@ -55,24 +58,22 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState('')
   const [mirror, setMirror] = useState(true)
   const [showOverlay, setShowOverlay] = useState(true)
-  const [debug, setDebug] = useState(false)
+  const [panelOpen, setPanelOpen] = useState(false)
   const [fps, setFps] = useState(0)
   const [trackCount, setTrackCount] = useState(0)
-  const [effect, setEffect] = useState<EffectType>('halo')
+  const [effect, setEffect] = useState<EffectType>('spotify')
   const [shape, setShape] = useState<ShapeMode>('box')
   const [interaction, setInteraction] = useState<InteractionMode>('none')
 
   const refs = {
     mirror: useRef(mirror),
     showOverlay: useRef(showOverlay),
-    debug: useRef(debug),
     effect: useRef(effect),
     shape: useRef(shape),
     interaction: useRef(interaction),
   }
   useEffect(() => { refs.mirror.current = mirror }, [mirror])
   useEffect(() => { refs.showOverlay.current = showOverlay }, [showOverlay])
-  useEffect(() => { refs.debug.current = debug }, [debug])
   useEffect(() => { refs.effect.current = effect }, [effect])
   useEffect(() => { refs.shape.current = shape }, [shape])
   useEffect(() => { refs.interaction.current = interaction }, [interaction])
@@ -82,25 +83,27 @@ export default function App() {
   const lastGestureRef = useRef<GestureRecognizerResult | null>(null)
   const lastSegMaskRef = useRef<ImageSegmenterResult | null>(null)
 
-  // 단축키 (IME 독립 — e.code 사용)
+  // 단축키 (e.code 기반 — 한글 IME OK)
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
       switch (e.code) {
-        case 'KeyD': setDebug((v) => !v); break
+        case 'KeyD': setPanelOpen((v) => !v); break
         case 'KeyM': setMirror((v) => !v); break
         case 'KeyO': setShowOverlay((v) => !v); break
         case 'KeyF': toggleFullscreen(); break
         case 'KeyB': setShape('box'); break
-        case 'KeyS': setShape('silhouette'); break
-        case 'Digit1': setEffect('halo'); break
-        case 'Digit2': setEffect('sequence'); break
-        case 'Digit3': setEffect('ring'); break
-        case 'Digit4': setEffect('particles'); break
+        case 'KeyS': setShape((s) => s === 'silhouette-bg' ? 'silhouette-fg' : 'silhouette-bg'); break
+        case 'Digit1': setEffect('spotify'); break
+        case 'Digit2': setEffect('halo'); break
+        case 'Digit3': setEffect('sequence'); break
+        case 'Digit4': setEffect('ring'); break
+        case 'Digit5': setEffect('particles'); break
         case 'KeyN': setInteraction('none'); break
         case 'KeyP': setInteraction('palm-hide'); break
         case 'KeyT': setInteraction('stillness-boost'); break
         case 'KeyJ': setInteraction('jump-grow'); break
+        case 'KeyE': setInteraction('evade'); break
       }
     }
     window.addEventListener('keydown', onKey)
@@ -117,7 +120,6 @@ export default function App() {
       try {
         setStatus('loading-model')
         const vision = await FilesetResolver.forVisionTasks(WASM_URL)
-
         const [detector, gesture, segmenter] = await Promise.all([
           ObjectDetector.createFromOptions(vision, {
             baseOptions: { modelAssetPath: OBJ_MODEL, delegate: 'GPU' },
@@ -138,7 +140,6 @@ export default function App() {
             outputConfidenceMasks: false,
           }),
         ])
-
         if (cancelled) {
           detector.close(); gesture.close(); segmenter.close()
           return
@@ -156,7 +157,6 @@ export default function App() {
           stream.getTracks().forEach((t) => t.stop())
           return
         }
-
         const video = videoRef.current!
         video.srcObject = stream
         await video.play()
@@ -218,13 +218,12 @@ export default function App() {
     const ctx = canvas.getContext('2d')!
     const mirrored = refs.mirror.current
 
-    // 거울 적용 후 카메라 그림
     ctx.save()
     if (mirrored) { ctx.translate(vw, 0); ctx.scale(-1, 1) }
     ctx.drawImage(video, 0, 0, vw, vh)
     ctx.restore()
 
-    // ─── Object detection (다인) ───
+    // ─── Person detection
     let objResult: ObjectDetectorResult | undefined
     try { objResult = detector.detectForVideo(video, ts) } catch { return }
     const detections: { bbox: BBox; score: number }[] = []
@@ -237,43 +236,42 @@ export default function App() {
         detections.push({ bbox: { x: b.originX, y: b.originY, w: b.width, h: b.height }, score: c.score })
       }
     }
-
     updateTracks(tracksRef.current, detections, ts, nextIdRef)
     if (tracksRef.current.length !== trackCount) setTrackCount(tracksRef.current.length)
 
-    // ─── Gesture detection (상호작용용) ───
+    // ─── Gesture (인터랙션용)
     let gestureResult: GestureRecognizerResult | undefined
     try { gestureResult = gesture.recognizeForVideo(video, ts) } catch { /* skip */ }
     if (gestureResult) lastGestureRef.current = gestureResult
 
-    // 상호작용 적용 — 각 트랙의 effectVisibility 갱신
     applyInteraction(tracksRef.current, lastGestureRef.current, refs.interaction.current, vw, vh, ts)
 
-    // ─── Silhouette 모드일 때만 segmenter 실행 ───
-    if (refs.debug.current && refs.shape.current === 'silhouette') {
+    // ─── Silhouette (선택 모드에서만)
+    const shapeMode = refs.shape.current
+    if (shapeMode === 'silhouette-bg' || shapeMode === 'silhouette-fg') {
       try {
         const seg = segmenter.segmentForVideo(video, ts)
         if (seg) lastSegMaskRef.current = seg
       } catch { /* skip */ }
     }
 
-    // ─── 효과 렌더 ───
+    // ─── 표시 (디버그 시각화)
+    if (shapeMode === 'silhouette-bg' && lastSegMaskRef.current) {
+      drawSilhouette(ctx, lastSegMaskRef.current, vw, vh, mirrored, 'bg')
+    }
+    if (shapeMode === 'silhouette-fg' && lastSegMaskRef.current) {
+      drawSilhouette(ctx, lastSegMaskRef.current, vw, vh, mirrored, 'fg')
+    }
+    if (shapeMode === 'box') {
+      for (const t of tracksRef.current) drawDebugBox(ctx, t, vw, mirrored)
+    }
+
+    // ─── 효과 렌더
     if (refs.showOverlay.current) {
       const fxType = refs.effect.current
       for (const t of tracksRef.current) {
         if (t.effectVisibility <= 0.01) continue
-        drawEffect(ctx, t, vw, vh, ts, mirrored, fxType)
-      }
-    }
-
-    // ─── 디버그 오버레이 ───
-    if (refs.debug.current) {
-      if (refs.shape.current === 'silhouette' && lastSegMaskRef.current) {
-        drawSilhouette(ctx, lastSegMaskRef.current, vw, vh, mirrored)
-      }
-      for (const t of tracksRef.current) {
-        if (refs.shape.current === 'box') drawDebugBox(ctx, t, vw, ts, mirrored)
-        drawDebugLabel(ctx, t, vw, ts, mirrored)
+        drawEffect(ctx, t, vw, ts, mirrored, fxType)
       }
     }
   }
@@ -283,18 +281,16 @@ export default function App() {
       <video ref={videoRef} playsInline muted style={{ display: 'none' }} />
       <canvas ref={canvasRef} style={canvasStyle} />
 
-      <ControlBar
-        debug={debug}
-        status={status}
-        errorMsg={errorMsg}
-        fps={fps}
-        trackCount={trackCount}
+      <StatusOverlay status={status} errorMsg={errorMsg} fps={fps} trackCount={trackCount} />
+
+      <BottomPanel
+        open={panelOpen}
+        toggle={() => setPanelOpen((v) => !v)}
         mirror={mirror}
         showOverlay={showOverlay}
         effect={effect}
         shape={shape}
         interaction={interaction}
-        setDebug={setDebug}
         setMirror={setMirror}
         setShowOverlay={setShowOverlay}
         setEffect={setEffect}
@@ -349,6 +345,7 @@ function updateTracks(
       stillSince: null,
       prevTopY: det.bbox.y,
       jumpBoost: 0,
+      evadeOffset: { x: 0, y: 0 },
     })
   }
   for (let i = tracks.length - 1; i >= 0; i--) {
@@ -379,15 +376,13 @@ function applyInteraction(
   vh: number,
   now: number,
 ) {
-  // 등장 페이드인 + 모드별 가시성 타겟 계산
   for (const t of tracks) {
     const age = now - t.firstSeenAt
     const entryFactor = clamp(age / ENTRY_ANIM_MS, 0, 1)
     const entryVis = easeOut(entryFactor)
-
     let targetVis = entryVis
 
-    // 모션 분석
+    // 모션 추적
     const cx = t.bbox.x + t.bbox.w / 2
     const cy = t.bbox.y + t.bbox.h / 2
     const dt = now - t.lastCenter.ts
@@ -396,56 +391,73 @@ function applyInteraction(
     else if (t.stillSince === null) t.stillSince = now
     t.lastCenter = { x: cx, y: cy, ts: now }
 
-    // 점프 (위로 빠르게 이동)
     if (t.prevTopY !== null && dt > 0) {
-      const dy = t.prevTopY - t.bbox.y // 양수 = 위로 이동
-      const speed = dy / dt * 1000     // px/sec
+      const dy = t.prevTopY - t.bbox.y
+      const speed = dy / dt * 1000
       if (speed > 400) t.jumpBoost = Math.min(1, t.jumpBoost + 0.5)
       else t.jumpBoost = Math.max(0, t.jumpBoost - 0.05)
     }
     t.prevTopY = t.bbox.y
 
+    // 모드별 처리
+    let evadeTargetX = 0, evadeTargetY = 0
+
     if (mode === 'palm-hide' && gesture) {
-      // 손바닥(Open_Palm)이 이 트랙 가까이 있으면 효과 숨김
-      const palmNear = palmCloseToTrack(gesture, t.bbox, vw, vh)
-      if (palmNear) targetVis = 0
-    }
-    if (mode === 'stillness-boost') {
-      // 정지하면 효과 강해짐(밝기), 움직이면 약함
-      if (t.stillSince !== null && now - t.stillSince > STILLNESS_DWELL_MS) targetVis = entryVis * 1.0
+      if (palmCloseToTrack(gesture, t.bbox, vw, vh)) targetVis = 0
+    } else if (mode === 'stillness-boost') {
+      if (t.stillSince !== null && now - t.stillSince > STILLNESS_DWELL_MS) targetVis = entryVis
       else targetVis = entryVis * 0.45
+    } else if (mode === 'evade' && gesture && gesture.landmarks) {
+      // 효과 위치(머리 부근) 계산
+      const headSize = Math.max(40, t.bbox.w * 0.35)
+      const fxCx = t.bbox.x + t.bbox.w / 2 + t.evadeOffset.x
+      const fxCy = t.bbox.y + headSize * 0.5 + t.evadeOffset.y
+      let totalX = 0, totalY = 0
+      for (const lm of gesture.landmarks) {
+        if (!lm?.length) continue
+        const wrist = lm[0]
+        const mid = lm[9] ?? lm[0]
+        const hx = ((wrist.x + mid.x) / 2) * vw
+        const hy = ((wrist.y + mid.y) / 2) * vh
+        const dist = Math.hypot(hx - fxCx, hy - fxCy)
+        if (dist < EVADE_INFLUENCE_PX) {
+          const dirX = fxCx - hx
+          const dirY = fxCy - hy
+          const len = Math.hypot(dirX, dirY) || 1
+          const strength = ((EVADE_INFLUENCE_PX - dist) / EVADE_INFLUENCE_PX) * EVADE_MAX_OFFSET_PX
+          totalX += (dirX / len) * strength
+          totalY += (dirY / len) * strength
+        }
+      }
+      evadeTargetX = totalX
+      evadeTargetY = totalY
     }
-    // jump-grow 모드는 가시성은 그대로(entry), 크기만 변화 → drawEffect에서 jumpBoost 사용
 
-    // 부드럽게 transition
-    const k = mode === 'palm-hide' ? 16 : 8 // palm은 더 즉각, stillness는 부드럽게
-    const dtSec = 1 / 60
-    t.effectVisibility = approach(t.effectVisibility, targetVis, dtSec * k)
+    // 가시성 스프링
+    const visK = mode === 'palm-hide' ? 0.27 : 0.13
+    t.effectVisibility = lerp(t.effectVisibility, targetVis, visK)
+
+    // evade 오프셋 스프링 (push 강할 땐 빠르게, 복귀는 부드럽게)
+    const evadeK = (evadeTargetX !== 0 || evadeTargetY !== 0) ? 0.3 : 0.12
+    t.evadeOffset.x = lerp(t.evadeOffset.x, evadeTargetX, evadeK)
+    t.evadeOffset.y = lerp(t.evadeOffset.y, evadeTargetY, evadeK)
   }
-}
-
-function approach(curr: number, target: number, step: number): number {
-  if (Math.abs(target - curr) < 0.001) return target
-  return curr + (target - curr) * clamp(step, 0, 1)
 }
 
 function palmCloseToTrack(g: GestureRecognizerResult, bbox: BBox, vw: number, vh: number): boolean {
   if (!g.gestures || !g.landmarks) return false
   for (let i = 0; i < g.gestures.length; i++) {
     const cat = g.gestures[i]?.[0]
-    if (!cat) continue
-    if (cat.categoryName !== 'Open_Palm') continue
+    if (!cat || cat.categoryName !== 'Open_Palm') continue
     const lm = g.landmarks[i]
-    if (!lm || !lm.length) continue
-    // 손의 중심 (wrist + middle finger MCP 평균)
+    if (!lm?.length) continue
     const wrist = lm[0]
     const mid = lm[9] ?? lm[0]
     const hx = ((wrist.x + mid.x) / 2) * vw
     const hy = ((wrist.y + mid.y) / 2) * vh
     const cx = bbox.x + bbox.w / 2
     const cy = bbox.y + bbox.h / 2
-    const dist = Math.hypot(hx - cx, hy - cy)
-    if (dist < bbox.w * PALM_PROXIMITY_RATIO) return true
+    if (Math.hypot(hx - cx, hy - cy) < bbox.w * PALM_PROXIMITY_RATIO) return true
   }
   return false
 }
@@ -456,42 +468,78 @@ function drawEffect(
   ctx: CanvasRenderingContext2D,
   t: Track,
   vw: number,
-  vh: number,
   ts: number,
   mirrored: boolean,
   fx: EffectType,
 ) {
   const headSize = Math.max(40, t.bbox.w * 0.35)
-  let cx = t.bbox.x + t.bbox.w / 2
-  const cy = t.bbox.y + headSize * 0.5
+  let cx = t.bbox.x + t.bbox.w / 2 + t.evadeOffset.x
+  const cy = t.bbox.y + headSize * 0.5 + t.evadeOffset.y
   if (mirrored) cx = vw - cx
 
-  const vis = t.effectVisibility
+  const age = ts - t.firstSeenAt
   const jumpScale = 1 + t.jumpBoost * 0.6
-  const scale = lerp(0.6, 1.0, vis) * jumpScale
-  const alpha = vis
+  let scale = lerp(0.5, 1.0, t.effectVisibility) * jumpScale
+
+  // spotify는 뽀잉 스프링 등장
+  if (fx === 'spotify') {
+    const tt = clamp(age / 700, 0, 1)
+    const overshoot = Math.sin(tt * Math.PI * 2.3) * Math.exp(-tt * 3.5) * 0.4
+    scale = (easeOut(tt) + overshoot) * jumpScale * t.effectVisibility
+  }
 
   ctx.save()
-  ctx.globalAlpha *= alpha
-  ctx.globalCompositeOperation = 'screen'
+  ctx.globalAlpha *= t.effectVisibility
 
   switch (fx) {
+    case 'spotify':
+      drawSpotifyLogo(ctx, cx, cy, headSize * 1.0 * Math.max(0.01, scale))
+      break
     case 'halo':
+      ctx.globalCompositeOperation = 'screen'
       drawHalo(ctx, cx, cy, headSize * 1.1 * scale)
       break
     case 'sequence':
+      ctx.globalCompositeOperation = 'screen'
       drawSequenceFrame(ctx, cx, cy, headSize * 1.3 * scale, ts, t.id)
       break
     case 'ring':
+      ctx.globalCompositeOperation = 'screen'
       drawRing(ctx, cx, cy, headSize * 1.2 * scale, ts, t.id)
       break
     case 'particles':
+      ctx.globalCompositeOperation = 'screen'
       drawParticles(ctx, cx, cy, headSize * 1.4 * scale, ts, t.id)
       break
   }
   ctx.restore()
+}
 
-  void vh
+// Spotify 로고 — 코드로 그리기 (PoC; 상업 사용 시 브랜드 가이드라인 준수 필요)
+function drawSpotifyLogo(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number) {
+  if (r < 1) return
+  // 초록 원
+  ctx.fillStyle = '#1DB954'
+  ctx.beginPath()
+  ctx.arc(cx, cy, r, 0, Math.PI * 2)
+  ctx.fill()
+
+  // 흰 곡선 3줄 (위→아래 갈수록 좁게, 굵기는 비슷)
+  ctx.strokeStyle = '#fff'
+  ctx.lineCap = 'round'
+  const offsets = [
+    { yo: -r * 0.30, rad: r * 0.78, lw: r * 0.16 },
+    { yo: -r * 0.08, rad: r * 0.60, lw: r * 0.13 },
+    { yo:  r * 0.14, rad: r * 0.42, lw: r * 0.11 },
+  ]
+  for (const o of offsets) {
+    ctx.lineWidth = o.lw
+    ctx.beginPath()
+    // 아래쪽으로 볼록한 호: 좌->우, 시작 각 ~ 200°, 끝 각 ~ 340° (정상 좌표계 기준 아래쪽)
+    const yCenter = cy + o.yo + o.rad * 0.55
+    ctx.arc(cx, yCenter, o.rad, Math.PI * 1.18, Math.PI * 1.82)
+    ctx.stroke()
+  }
 }
 
 function drawHalo(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number) {
@@ -505,25 +553,18 @@ function drawHalo(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: numb
   ctx.fill()
 }
 
-// 코드로 그리는 샘플 시퀀스 — 회전+펄스. 추후 실제 PNG 시퀀스로 교체 가능
 function drawSequenceFrame(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, ts: number, seed: number) {
-  const FRAMES = 24
-  const PERIOD_MS = 1600
+  const FRAMES = 24, PERIOD_MS = 1600
   const frame = Math.floor(((ts + seed * 137) % PERIOD_MS) / PERIOD_MS * FRAMES)
   const phase = (frame / FRAMES) * Math.PI * 2
-
-  // 외곽 글로우 펄스
   const pulse = 0.85 + 0.15 * Math.sin(phase * 2)
   const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r * pulse)
   grad.addColorStop(0, 'rgba(180, 230, 255, 0.85)')
   grad.addColorStop(0.5, 'rgba(120, 180, 255, 0.5)')
   grad.addColorStop(1, 'rgba(80, 120, 255, 0)')
   ctx.fillStyle = grad
-  ctx.beginPath()
-  ctx.arc(cx, cy, r * pulse, 0, Math.PI * 2)
-  ctx.fill()
+  ctx.beginPath(); ctx.arc(cx, cy, r * pulse, 0, Math.PI * 2); ctx.fill()
 
-  // 회전하는 광원 6개
   const N = 6
   for (let i = 0; i < N; i++) {
     const a = phase + (i / N) * Math.PI * 2
@@ -534,9 +575,7 @@ function drawSequenceFrame(ctx: CanvasRenderingContext2D, cx: number, cy: number
     g2.addColorStop(0, 'rgba(255, 250, 200, 0.95)')
     g2.addColorStop(1, 'rgba(255, 200, 100, 0)')
     ctx.fillStyle = g2
-    ctx.beginPath()
-    ctx.arc(px, py, sr, 0, Math.PI * 2)
-    ctx.fill()
+    ctx.beginPath(); ctx.arc(px, py, sr, 0, Math.PI * 2); ctx.fill()
   }
 }
 
@@ -547,9 +586,7 @@ function drawRing(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: numb
     const a0 = rot + (i / 3) * Math.PI * 2
     const a1 = a0 + Math.PI * 0.5
     ctx.strokeStyle = `hsla(${(seed * 67 + i * 30) % 360}, 90%, 70%, 0.85)`
-    ctx.beginPath()
-    ctx.arc(cx, cy, r * (0.95 - i * 0.08), a0, a1)
-    ctx.stroke()
+    ctx.beginPath(); ctx.arc(cx, cy, r * (0.95 - i * 0.08), a0, a1); ctx.stroke()
   }
 }
 
@@ -566,16 +603,13 @@ function drawParticles(ctx: CanvasRenderingContext2D, cx: number, cy: number, r:
     grad.addColorStop(0, `hsla(${(seed * 23 + i * 25 + ts / 30) % 360}, 95%, 75%, 0.9)`)
     grad.addColorStop(1, 'rgba(255,255,255,0)')
     ctx.fillStyle = grad
-    ctx.beginPath()
-    ctx.arc(px, py, sr, 0, Math.PI * 2)
-    ctx.fill()
+    ctx.beginPath(); ctx.arc(px, py, sr, 0, Math.PI * 2); ctx.fill()
   }
-  void seed
 }
 
-// ─── 디버그 시각화 ──────────────────────────────────────
+// ─── 시각화: 박스 / 윤곽 ────────────────────────────────
 
-function drawDebugBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, _now: number, mirrored: boolean) {
+function drawDebugBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirrored: boolean) {
   let x = t.bbox.x
   if (mirrored) x = vw - t.bbox.x - t.bbox.w
   const { y, w, h } = t.bbox
@@ -584,53 +618,47 @@ function drawDebugBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, _now:
   ctx.strokeStyle = color
   ctx.lineWidth = 3
   ctx.strokeRect(x, y, w, h)
-  ctx.restore()
-}
-
-function drawDebugLabel(ctx: CanvasRenderingContext2D, t: Track, vw: number, now: number, mirrored: boolean) {
-  let x = t.bbox.x
-  if (mirrored) x = vw - t.bbox.x - t.bbox.w
-  const { y } = t.bbox
-  const dwellSec = (now - t.firstSeenAt) / 1000
-  const dwellStr = dwellSec < 10 ? dwellSec.toFixed(1) : Math.round(dwellSec).toString()
-  const color = colorForId(t.id)
-  const label = `#${t.id}   ${dwellStr}s   ${(t.score * 100).toFixed(0)}%`
-
-  ctx.save()
-  ctx.font = 'bold 18px ui-monospace, Menlo, monospace'
-  const textW = ctx.measureText(label).width
-  const padX = 10
-  const labelH = 28
-  const labelY = Math.max(0, y - labelH - 2)
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.85)'
-  ctx.fillRect(x, labelY, textW + padX * 2, labelH)
-  ctx.strokeStyle = color
-  ctx.lineWidth = 2
-  ctx.strokeRect(x, labelY, textW + padX * 2, labelH)
   ctx.fillStyle = color
-  ctx.textBaseline = 'middle'
-  ctx.fillText(label, x + padX, labelY + labelH / 2 + 1)
+  ctx.font = 'bold 16px ui-monospace, Menlo, monospace'
+  ctx.textBaseline = 'bottom'
+  const label = `#${t.id}  ${(t.score * 100).toFixed(0)}%`
+  ctx.fillText(label, x + 4, Math.max(16, y - 4))
   ctx.restore()
 }
 
-function drawSilhouette(ctx: CanvasRenderingContext2D, seg: ImageSegmenterResult, vw: number, vh: number, mirrored: boolean) {
+function drawSilhouette(
+  ctx: CanvasRenderingContext2D,
+  seg: ImageSegmenterResult,
+  vw: number,
+  vh: number,
+  mirrored: boolean,
+  side: 'bg' | 'fg',
+) {
   const mask = seg.categoryMask
   if (!mask) return
   const w = mask.width
   const h = mask.height
   const data = mask.getAsUint8Array()
-  // 마스크를 캔버스로 합성
   const off = document.createElement('canvas')
   off.width = w; off.height = h
   const offCtx = off.getContext('2d')!
   const img = offCtx.createImageData(w, h)
+
+  // selfie_segmenter는 일반적으로 person 영역에 작은 값, 배경에 큰 값 (또는 반대)
+  // 두 모드 모두 지원: 'bg'는 v===0 영역 컬러, 'fg'는 v!==0 영역 컬러
+  const targetIsZero = side === 'bg'
+  const baseR = side === 'bg' ? 0 : 255
+  const baseG = side === 'bg' ? 255 : 120
+  const baseB = side === 'bg' ? 200 : 60
+
   for (let i = 0; i < data.length; i++) {
-    const v = data[i] // 0 = background, !=0 = foreground (selfie_segmenter)
+    const v = data[i]
+    const matches = targetIsZero ? (v === 0) : (v !== 0)
     const o = i * 4
-    if (v === 0) {
-      img.data[o] = 0; img.data[o + 1] = 255; img.data[o + 2] = 200; img.data[o + 3] = 0
+    if (matches) {
+      img.data[o] = baseR; img.data[o + 1] = baseG; img.data[o + 2] = baseB; img.data[o + 3] = 120
     } else {
-      img.data[o] = 0; img.data[o + 1] = 255; img.data[o + 2] = 200; img.data[o + 3] = 110
+      img.data[o] = 0; img.data[o + 1] = 0; img.data[o + 2] = 0; img.data[o + 3] = 0
     }
   }
   offCtx.putImageData(img, 0, 0)
@@ -639,77 +667,24 @@ function drawSilhouette(ctx: CanvasRenderingContext2D, seg: ImageSegmenterResult
   if (mirrored) { ctx.translate(vw, 0); ctx.scale(-1, 1) }
   ctx.globalCompositeOperation = 'screen'
   ctx.drawImage(off, 0, 0, vw, vh)
+
+  // fg 모드는 외곽선 강조 — 살짝 확대 후 stroke 효과
+  if (side === 'fg') {
+    ctx.globalCompositeOperation = 'source-over'
+    ctx.shadowColor = `rgba(${baseR}, ${baseG}, ${baseB}, 0.9)`
+    ctx.shadowBlur = 16
+    ctx.drawImage(off, 0, 0, vw, vh)
+    ctx.shadowBlur = 0
+  }
   ctx.restore()
 }
 
 const COLORS = ['#7ee', '#ff7', '#f7f', '#7f7', '#f77', '#77f', '#fa7', '#7fa', '#a7f', '#f7a']
 function colorForId(id: number): string { return COLORS[id % COLORS.length] }
 
-// ─── 컨트롤바 (우상단) ──────────────────────────────────
+// ─── UI: 좌상단 상태 ────────────────────────────────────
 
-type Setters = {
-  setDebug: React.Dispatch<React.SetStateAction<boolean>>
-  setMirror: React.Dispatch<React.SetStateAction<boolean>>
-  setShowOverlay: React.Dispatch<React.SetStateAction<boolean>>
-  setEffect: React.Dispatch<React.SetStateAction<EffectType>>
-  setShape: React.Dispatch<React.SetStateAction<ShapeMode>>
-  setInteraction: React.Dispatch<React.SetStateAction<InteractionMode>>
-}
-
-function ControlBar(props: {
-  debug: boolean
-  status: Status
-  errorMsg: string
-  fps: number
-  trackCount: number
-  mirror: boolean
-  showOverlay: boolean
-  effect: EffectType
-  shape: ShapeMode
-  interaction: InteractionMode
-} & Setters) {
-  const { debug, status, errorMsg, fps, trackCount, mirror, showOverlay, effect, shape, interaction,
-    setDebug, setMirror, setShowOverlay, setEffect, setShape, setInteraction } = props
-
-  return (
-    <div style={barWrapStyle}>
-      <button
-        type="button"
-        title="디버그 토글 (D)"
-        onClick={() => setDebug((d) => !d)}
-        style={dotStyle(debug)}
-      />
-      {debug && (
-        <div style={panelStyle}>
-          <StatusLine status={status} errorMsg={errorMsg} fps={fps} trackCount={trackCount} />
-          <Row label="모드">
-            <Toggle on={mirror} onClick={() => setMirror((v) => !v)}>거울 <K>M</K></Toggle>
-            <Toggle on={showOverlay} onClick={() => setShowOverlay((v) => !v)}>효과 <K>O</K></Toggle>
-            <Toggle on={false} onClick={toggleFullscreen}>풀스크린 <K>F</K></Toggle>
-          </Row>
-          <Row label="표시">
-            <Toggle on={shape === 'box'} onClick={() => setShape('box')}>박스 <K>B</K></Toggle>
-            <Toggle on={shape === 'silhouette'} onClick={() => setShape('silhouette')}>윤곽 <K>S</K></Toggle>
-          </Row>
-          <Row label="효과">
-            <Toggle on={effect === 'halo'} onClick={() => setEffect('halo')}>halo <K>1</K></Toggle>
-            <Toggle on={effect === 'sequence'} onClick={() => setEffect('sequence')}>시퀀스 <K>2</K></Toggle>
-            <Toggle on={effect === 'ring'} onClick={() => setEffect('ring')}>ring <K>3</K></Toggle>
-            <Toggle on={effect === 'particles'} onClick={() => setEffect('particles')}>파티클 <K>4</K></Toggle>
-          </Row>
-          <Row label="상호작용">
-            <Toggle on={interaction === 'none'} onClick={() => setInteraction('none')}>없음 <K>N</K></Toggle>
-            <Toggle on={interaction === 'palm-hide'} onClick={() => setInteraction('palm-hide')}>손바닥숨김 <K>P</K></Toggle>
-            <Toggle on={interaction === 'stillness-boost'} onClick={() => setInteraction('stillness-boost')}>정지강화 <K>T</K></Toggle>
-            <Toggle on={interaction === 'jump-grow'} onClick={() => setInteraction('jump-grow')}>점프확대 <K>J</K></Toggle>
-          </Row>
-        </div>
-      )}
-    </div>
-  )
-}
-
-function StatusLine(props: { status: Status; errorMsg: string; fps: number; trackCount: number }) {
+function StatusOverlay(props: { status: Status; errorMsg: string; fps: number; trackCount: number }) {
   const { status, errorMsg, fps, trackCount } = props
   const label: Record<Status, string> = {
     idle: '⚪ idle',
@@ -720,18 +695,84 @@ function StatusLine(props: { status: Status; errorMsg: string; fps: number; trac
   }
   const fpsColor = fps >= 50 ? '#7ee' : fps >= 30 ? '#ff7' : '#f77'
   return (
-    <div style={statusLineStyle}>
+    <div style={statusOverlayStyle}>
       <span>{label[status]}</span>
       {status === 'running' && (
         <>
-          <Sep />
+          <span style={{ opacity: 0.4 }}>·</span>
           <span style={{ color: fpsColor }}>{fps} fps</span>
-          <Sep />
-          <span>👥 {trackCount}명</span>
+          <span style={{ opacity: 0.4 }}>·</span>
+          <span>👥 {trackCount}</span>
         </>
       )}
-      {status === 'error' && <span style={{ color: '#f77' }}>· {errorMsg}</span>}
+      {status === 'error' && <span style={{ color: '#f77', marginLeft: 6 }}>{errorMsg}</span>}
     </div>
+  )
+}
+
+// ─── UI: 하단 중앙 패널 ─────────────────────────────────
+
+function BottomPanel(props: {
+  open: boolean
+  toggle: () => void
+  mirror: boolean
+  showOverlay: boolean
+  effect: EffectType
+  shape: ShapeMode
+  interaction: InteractionMode
+  setMirror: React.Dispatch<React.SetStateAction<boolean>>
+  setShowOverlay: React.Dispatch<React.SetStateAction<boolean>>
+  setEffect: React.Dispatch<React.SetStateAction<EffectType>>
+  setShape: React.Dispatch<React.SetStateAction<ShapeMode>>
+  setInteraction: React.Dispatch<React.SetStateAction<InteractionMode>>
+}) {
+  const { open, toggle, mirror, showOverlay, effect, shape, interaction,
+    setMirror, setShowOverlay, setEffect, setShape, setInteraction } = props
+
+  return (
+    <div style={bottomWrapStyle}>
+      {open && (
+        <div style={panelStyle}>
+          <Row label="모드">
+            <Toggle on={mirror} onClick={() => setMirror((v) => !v)}>거울 <K>M</K></Toggle>
+            <Toggle on={showOverlay} onClick={() => setShowOverlay((v) => !v)}>효과 <K>O</K></Toggle>
+            <Toggle on={false} onClick={toggleFullscreen}>풀스크린 <K>F</K></Toggle>
+          </Row>
+          <Row label="표시">
+            <Toggle on={shape === 'box'} onClick={() => setShape('box')}>박스 <K>B</K></Toggle>
+            <Toggle on={shape === 'silhouette-bg'} onClick={() => setShape('silhouette-bg')}>윤곽-배경 <K>S</K></Toggle>
+            <Toggle on={shape === 'silhouette-fg'} onClick={() => setShape('silhouette-fg')}>윤곽-사람 <K>S</K></Toggle>
+          </Row>
+          <Row label="효과">
+            <Toggle on={effect === 'spotify'} onClick={() => setEffect('spotify')}>spotify <K>1</K></Toggle>
+            <Toggle on={effect === 'halo'} onClick={() => setEffect('halo')}>halo <K>2</K></Toggle>
+            <Toggle on={effect === 'sequence'} onClick={() => setEffect('sequence')}>시퀀스 <K>3</K></Toggle>
+            <Toggle on={effect === 'ring'} onClick={() => setEffect('ring')}>ring <K>4</K></Toggle>
+            <Toggle on={effect === 'particles'} onClick={() => setEffect('particles')}>파티클 <K>5</K></Toggle>
+          </Row>
+          <Row label="상호작용">
+            <Toggle on={interaction === 'none'} onClick={() => setInteraction('none')}>없음 <K>N</K></Toggle>
+            <Toggle on={interaction === 'palm-hide'} onClick={() => setInteraction('palm-hide')}>손바닥숨김 <K>P</K></Toggle>
+            <Toggle on={interaction === 'stillness-boost'} onClick={() => setInteraction('stillness-boost')}>정지강화 <K>T</K></Toggle>
+            <Toggle on={interaction === 'jump-grow'} onClick={() => setInteraction('jump-grow')}>점프확대 <K>J</K></Toggle>
+            <Toggle on={interaction === 'evade'} onClick={() => setInteraction('evade')}>도망 <K>E</K></Toggle>
+          </Row>
+        </div>
+      )}
+      <button type="button" onClick={toggle} title="효과 패널 (D)" style={fabStyle(open)}>
+        <SparkleIcon />
+      </button>
+    </div>
+  )
+}
+
+function SparkleIcon() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M12 3 L13.5 9 L20 10.5 L13.5 12 L12 18 L10.5 12 L4 10.5 L10.5 9 Z" />
+      <path d="M19 17 L19.7 19 L22 19.7 L19.7 20.4 L19 22.5 L18.3 20.4 L16 19.7 L18.3 19 Z" />
+      <path d="M5 15 L5.5 16.5 L7 17 L5.5 17.5 L5 19 L4.5 17.5 L3 17 L4.5 16.5 Z" />
+    </svg>
   )
 }
 
@@ -745,14 +786,8 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 }
 
 function Toggle({ on, onClick, children }: { on: boolean; onClick: () => void; children: React.ReactNode }) {
-  return (
-    <button type="button" onClick={onClick} style={toggleStyle(on)}>
-      {children}
-    </button>
-  )
+  return <button type="button" onClick={onClick} style={toggleStyle(on)}>{children}</button>
 }
-
-function Sep() { return <span style={{ opacity: 0.4 }}>·</span> }
 
 function K({ children }: { children: React.ReactNode }) {
   return <kbd style={kbdStyle}>{children}</kbd>
@@ -766,67 +801,62 @@ function toggleFullscreen() {
 // ─── 스타일 ─────────────────────────────────────────────
 
 const containerStyle: React.CSSProperties = {
-  position: 'fixed',
-  inset: 0,
-  background: '#000',
-  overflow: 'hidden',
+  position: 'fixed', inset: 0, background: '#000', overflow: 'hidden',
 }
 
 const canvasStyle: React.CSSProperties = {
-  width: '100%',
-  height: '100%',
-  objectFit: 'cover',
-  display: 'block',
+  width: '100%', height: '100%', objectFit: 'cover', display: 'block',
 }
 
-const barWrapStyle: React.CSSProperties = {
+const statusOverlayStyle: React.CSSProperties = {
   position: 'fixed',
   top: 14,
-  right: 14,
+  left: 14,
+  zIndex: 10,
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  fontSize: 13,
+  fontWeight: 600,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  color: '#fff',
+  textShadow: '0 1px 3px rgba(0,0,0,0.85)',
+  pointerEvents: 'none',
+  maxWidth: 'calc(100vw - 28px)',
+}
+
+const bottomWrapStyle: React.CSSProperties = {
+  position: 'fixed',
+  left: '50%',
+  bottom: 16,
+  transform: 'translateX(-50%)',
   zIndex: 10,
   display: 'flex',
   flexDirection: 'column',
-  alignItems: 'flex-end',
+  alignItems: 'center',
   gap: 10,
   maxWidth: 'calc(100vw - 28px)',
+  width: 'max-content',
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
   color: '#fff',
-  textShadow: '0 1px 2px rgba(0,0,0,0.8)',
+  textShadow: '0 1px 2px rgba(0,0,0,0.85)',
 }
-
-const dotStyle = (on: boolean): React.CSSProperties => ({
-  width: 16,
-  height: 16,
-  borderRadius: '50%',
-  border: '1px solid rgba(255,255,255,0.6)',
-  background: on ? '#7ee' : 'rgba(255,255,255,0.18)',
-  cursor: 'pointer',
-  padding: 0,
-  boxShadow: on ? '0 0 12px rgba(126,238,238,0.7)' : 'none',
-})
 
 const panelStyle: React.CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
   gap: 8,
   fontSize: 13,
-  maxWidth: 'min(420px, calc(100vw - 28px))',
-}
-
-const statusLineStyle: React.CSSProperties = {
-  display: 'flex',
-  alignItems: 'center',
-  gap: 8,
-  fontWeight: 600,
-  fontSize: 13,
+  maxWidth: 'min(560px, calc(100vw - 28px))',
+  alignItems: 'flex-start',
 }
 
 const rowStyle: React.CSSProperties = {
   display: 'flex',
   alignItems: 'center',
-  gap: 8,
+  gap: 10,
   flexWrap: 'wrap',
-  justifyContent: 'flex-end',
+  justifyContent: 'flex-start',
 }
 
 const rowLabelStyle: React.CSSProperties = {
@@ -834,13 +864,13 @@ const rowLabelStyle: React.CSSProperties = {
   opacity: 0.7,
   letterSpacing: 0.5,
   textTransform: 'uppercase',
+  minWidth: 60,
 }
 
 const rowChildrenStyle: React.CSSProperties = {
   display: 'flex',
   flexWrap: 'wrap',
   gap: 6,
-  justifyContent: 'flex-end',
 }
 
 const toggleStyle = (on: boolean): React.CSSProperties => ({
@@ -867,3 +897,19 @@ const kbdStyle: React.CSSProperties = {
   fontFamily: 'inherit',
   textShadow: 'none',
 }
+
+const fabStyle = (open: boolean): React.CSSProperties => ({
+  width: 48,
+  height: 48,
+  borderRadius: '50%',
+  border: `1px solid ${open ? 'rgba(126,238,238,0.7)' : 'rgba(255,255,255,0.4)'}`,
+  background: open ? 'rgba(126,238,238,0.18)' : 'rgba(0,0,0,0.55)',
+  backdropFilter: 'blur(8px)',
+  color: '#fff',
+  cursor: 'pointer',
+  padding: 0,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  boxShadow: open ? '0 0 16px rgba(126,238,238,0.5)' : '0 2px 8px rgba(0,0,0,0.5)',
+})
