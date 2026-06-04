@@ -8,6 +8,8 @@ const MAX_DETECTIONS = 20            // 모델에 요청할 최대 detection 개
 const TRACK_TIMEOUT_MS = 800         // 사라진 트랙을 유지할 시간
 const TRACK_MATCH_IOU = 0.2          // 같은 사람으로 매칭할 IoU 임계
 const SCORE_THRESHOLD = 0.45
+const POSITION_ALPHA = 0.35          // bbox 위치/크기 EMA — 낮을수록 부드러움 (응답 ↓)
+const SCORE_ALPHA = 0.15             // 인식률 EMA — 더 느리게 (텍스트 떨림 방지)
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 
@@ -249,8 +251,15 @@ function updateTracks(
       }
     }
     if (bestIdx >= 0) {
-      track.bbox = detections[bestIdx].bbox
-      track.score = detections[bestIdx].score
+      const det = detections[bestIdx]
+      // EMA 스무딩: bbox 위치/크기 떨림 완화
+      track.bbox = {
+        x: lerp(track.bbox.x, det.bbox.x, POSITION_ALPHA),
+        y: lerp(track.bbox.y, det.bbox.y, POSITION_ALPHA),
+        w: lerp(track.bbox.w, det.bbox.w, POSITION_ALPHA),
+        h: lerp(track.bbox.h, det.bbox.h, POSITION_ALPHA),
+      }
+      track.score = lerp(track.score, det.score, SCORE_ALPHA)
       track.lastSeenAt = now
       used.add(bestIdx)
     }
@@ -272,6 +281,10 @@ function updateTracks(
       tracks.splice(i, 1)
     }
   }
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t
 }
 
 function iouOf(a: BBox, b: BBox): number {
@@ -313,19 +326,37 @@ function drawDebugBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, now: 
   if (mirrored) x = vw - t.bbox.x - t.bbox.w
   const { y, w, h } = t.bbox
   const dwellSec = (now - t.firstSeenAt) / 1000
+  const dwellStr = dwellSec < 10 ? dwellSec.toFixed(1) : Math.round(dwellSec).toString()
+  const color = colorForId(t.id)
 
   ctx.save()
-  ctx.strokeStyle = colorForId(t.id)
-  ctx.lineWidth = 2
+
+  // 박스 (테두리)
+  ctx.strokeStyle = color
+  ctx.lineWidth = 3
   ctx.strokeRect(x, y, w, h)
 
-  const label = `#${t.id}  ${dwellSec.toFixed(1)}s  ${(t.score * 100).toFixed(0)}%`
-  ctx.font = 'bold 14px ui-monospace, Menlo, monospace'
+  // 라벨
+  const label = `#${t.id}   ${dwellStr}s   ${(t.score * 100).toFixed(0)}%`
+  ctx.font = 'bold 18px ui-monospace, Menlo, monospace'
   const textW = ctx.measureText(label).width
-  ctx.fillStyle = colorForId(t.id)
-  ctx.fillRect(x, y - 22, textW + 12, 22)
-  ctx.fillStyle = '#000'
-  ctx.fillText(label, x + 6, y - 6)
+  const padX = 10
+  const padY = 6
+  const labelH = 28
+  const labelY = Math.max(0, y - labelH - 2)
+
+  // 라벨 배경 (반투명 검정 + 컬러 외곽)
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.85)'
+  ctx.fillRect(x, labelY, textW + padX * 2, labelH)
+  ctx.strokeStyle = color
+  ctx.lineWidth = 2
+  ctx.strokeRect(x, labelY, textW + padX * 2, labelH)
+
+  // 텍스트
+  ctx.fillStyle = color
+  ctx.textBaseline = 'middle'
+  ctx.fillText(label, x + padX, labelY + labelH / 2 + 1)
+
   ctx.restore()
 }
 
