@@ -341,7 +341,6 @@ function drawDebugBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, now: 
   ctx.font = 'bold 18px ui-monospace, Menlo, monospace'
   const textW = ctx.measureText(label).width
   const padX = 10
-  const padY = 6
   const labelH = 28
   const labelY = Math.max(0, y - labelH - 2)
 
