@@ -22,21 +22,23 @@ const POSITION_ALPHA = 0.35
 const SCORE_ALPHA = 0.15
 const ENTRY_ANIM_MS = 600
 const SPOTIFY_ENTRY_MS = 900
-const PALM_PROXIMITY_RATIO = 0.6
-const STILLNESS_DWELL_MS = 1500
-const STILLNESS_MOVE_PX = 25
-const EVADE_MIN_DIST_PX = 130        // 효과와 손 사이 최소 거리 (절대 못 닿음)
-const EVADE_RELEASE_PX = 220         // 손이 이만큼 멀어지면 효과 복귀
-const MAGNET_RANGE_PX = 300
 const FS_UI_HIDE_MS = 3000
+const LIKE_BURST_MS = 1000
+const DROP_BURST_MS = 800
+const SKIP_BURST_MS = 700
+const TOGETHER_RANGE_PX = 320
+const HEAD_DIST_NEAR_X = 0.4    // bbox 중심 거리/평균 bbox.w 이하 시 가까움
+const SPOTIFY_GREEN = '#1DB954'
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 type BBox = { x: number; y: number; w: number; h: number }
-type EffectType = 'none' | 'spotify' | 'halo' | 'sequence' | 'ring' | 'particles'
-type ShapeMode = 'none' | 'box' | 'silhouette-bg' | 'silhouette-fg'
+type EffectType = 'none' | 'pop' | 'bounce' | 'orbit' | 'multiply' | 'breathe' | 'pulse'
+type ShapeMode = 'none' | 'box' | 'silhouette-bg' | 'silhouette-fg' | 'silhouette-outline'
 type InteractionMode =
-  | 'none' | 'palm-hide' | 'stillness-boost' | 'jump-grow' | 'evade'
-  | 'magnet' | 'hands-up'
+  | 'none' | 'move-music' | 'volume-up' | 'tap-like' | 'listen-together'
+  | 'drop-beat' | 'skip-track' | 'headphones' | 'discover' | 'group-sync'
+
+type DiscoverLogo = { x: number; y: number; bornAt: number; ttl: number }
 
 type Track = {
   id: number
@@ -47,11 +49,17 @@ type Track = {
   lastSeenAt: number
   effectVisibility: number
   lastCenter: { x: number; y: number; ts: number }
-  stillSince: number | null
-  prevTopY: number | null
-  jumpBoost: number
-  evadeOffset: { x: number; y: number }
-  handsUpBoost: number
+  movementLevel: number
+  handsUpLevel: number
+  likeBurstAt: number | null
+  togetherOffset: { x: number; y: number }
+  dropBurstAt: number | null
+  skipBurstAt: number | null
+  skipDir: -1 | 1
+  headphonesActive: boolean
+  discoverLogos: DiscoverLogo[]
+  lastDiscoverAt: number
+  groupSyncHue: number
 }
 
 export default function App() {
@@ -88,6 +96,10 @@ export default function App() {
   const nextIdRef = useRef(1)
   const lastGestureRef = useRef<GestureRecognizerResult | null>(null)
   const lastSegMaskRef = useRef<ImageSegmenterResult | null>(null)
+  // skip-track 용 손 이전 위치 추적
+  const lastHandPosRef = useRef<{ x: number; y: number; ts: number }[]>([])
+  // group-sync 글로벌 hue
+  const groupHueRef = useRef(0)
 
   function setEffect(next: EffectType) {
     const now = performance.now()
@@ -171,10 +183,7 @@ export default function App() {
           const now = performance.now()
           const dt = now - lastTs
           lastTs = now
-          if (dt > 0) {
-            fpsBuf.push(1000 / dt)
-            if (fpsBuf.length > 30) fpsBuf.shift()
-          }
+          if (dt > 0) { fpsBuf.push(1000 / dt); if (fpsBuf.length > 30) fpsBuf.shift() }
           if (fpsBuf.length === 30) {
             const avg = fpsBuf.reduce((a, b) => a + b, 0) / fpsBuf.length
             setFps(Math.round(avg))
@@ -246,31 +255,38 @@ export default function App() {
     try { gestureResult = gesture.recognizeForVideo(video, ts) } catch { /* skip */ }
     if (gestureResult) lastGestureRef.current = gestureResult
 
-    applyInteraction(tracksRef.current, lastGestureRef.current, refs.interaction.current, vw, vh, ts, refs.effect.current)
+    applyInteractions(
+      tracksRef.current,
+      lastGestureRef.current,
+      refs.interaction.current,
+      vw, vh, ts,
+      lastHandPosRef.current,
+      groupHueRef,
+    )
 
     const shapeMode = refs.shape.current
-    if (shapeMode === 'silhouette-bg' || shapeMode === 'silhouette-fg') {
+    if (shapeMode === 'silhouette-bg' || shapeMode === 'silhouette-fg' || shapeMode === 'silhouette-outline') {
       try {
         const seg = segmenter.segmentForVideo(video, ts)
         if (seg) lastSegMaskRef.current = seg
       } catch { /* skip */ }
       if (lastSegMaskRef.current) {
-        drawSilhouette(ctx, lastSegMaskRef.current, vw, vh, mirrored, shapeMode === 'silhouette-bg' ? 'bg' : 'fg')
+        drawSilhouette(ctx, lastSegMaskRef.current, vw, vh, mirrored, shapeMode)
       }
     }
     if (shapeMode === 'box') {
       for (const t of tracksRef.current) drawBBox(ctx, t, vw, mirrored)
     }
     if (shapeMode !== 'none') {
-      // 표시용 번호는 화면에 보이는 순서 인덱스(1..N) — 사람이 빠지면 다음 사람이 그 번호를 가져감
       tracksRef.current.forEach((t, i) => drawHeadLabel(ctx, t, i + 1, vw, mirrored))
     }
 
     if (showOverlayRef.current && refs.effect.current !== 'none') {
       const fxType = refs.effect.current
+      const interactionMode = refs.interaction.current
       for (const t of tracksRef.current) {
         if (t.effectVisibility <= 0.01) continue
-        drawEffect(ctx, t, vw, ts, mirrored, fxType)
+        drawEffect(ctx, t, vw, ts, mirrored, fxType, interactionMode)
       }
     }
   }
@@ -349,11 +365,17 @@ function updateTracks(
       lastSeenAt: now,
       effectVisibility: 0,
       lastCenter: { x: det.bbox.x + det.bbox.w / 2, y: det.bbox.y + det.bbox.h / 2, ts: now },
-      stillSince: null,
-      prevTopY: det.bbox.y,
-      jumpBoost: 0,
-      evadeOffset: { x: 0, y: 0 },
-      handsUpBoost: 0,
+      movementLevel: 0,
+      handsUpLevel: 0,
+      likeBurstAt: null,
+      togetherOffset: { x: 0, y: 0 },
+      dropBurstAt: null,
+      skipBurstAt: null,
+      skipDir: 1,
+      headphonesActive: false,
+      discoverLogos: [],
+      lastDiscoverAt: 0,
+      groupSyncHue: 0,
     })
   }
   for (let i = tracks.length - 1; i >= 0; i--) {
@@ -375,167 +397,242 @@ function clamp(v: number, lo: number, hi: number): number { return Math.max(lo, 
 function easeOutCubic(t: number): number { return 1 - Math.pow(1 - t, 3) }
 function easeOutQuint(t: number): number { return 1 - Math.pow(1 - t, 5) }
 
-// ─── 효과 anchor (인터랙션·렌더 공유) ────────────────────
-
-function effectAnchor(t: Track, fx: EffectType) {
+function effectAnchor(t: Track) {
   const headSize = Math.max(40, t.bbox.w * 0.35)
-  if (fx === 'spotify') {
-    return {
-      cx: t.bbox.x + t.bbox.w / 2 + headSize * 0.7,
-      cy: t.bbox.y + headSize * 0.3,
-      headSize,
-    }
-  }
   return {
-    cx: t.bbox.x + t.bbox.w / 2,
-    cy: t.bbox.y + headSize * 0.5,
+    cx: t.bbox.x + t.bbox.w / 2 + headSize * 0.7,
+    cy: t.bbox.y + headSize * 0.3,
     headSize,
+    headCx: t.bbox.x + t.bbox.w / 2,
+    headCy: t.bbox.y + headSize * 0.4,
   }
+}
+
+function handBelongsTo(hx: number, hy: number, bbox: BBox): boolean {
+  // 손 위치가 사람 박스 범위 안 또는 살짝 위 있으면 그 사람의 손으로 간주
+  const pad = bbox.w * 0.4
+  return hx > bbox.x - pad && hx < bbox.x + bbox.w + pad &&
+         hy > bbox.y - pad && hy < bbox.y + bbox.h + pad
 }
 
 // ─── 상호작용 ───────────────────────────────────────────
 
-function applyInteraction(
+function applyInteractions(
   tracks: Track[],
   gesture: GestureRecognizerResult | null,
   mode: InteractionMode,
   vw: number,
   vh: number,
   now: number,
-  effect: EffectType,
+  lastHandPos: { x: number; y: number; ts: number }[],
+  groupHueRef: { current: number },
 ) {
+  // 등장 페이드 + 움직임 추적 + 기본 정리
   for (const t of tracks) {
     const age = now - t.firstSeenAt
-    const entryFactor = clamp(age / ENTRY_ANIM_MS, 0, 1)
-    const entryVis = easeOutCubic(entryFactor)
-    let targetVis = entryVis
-
+    const entryVis = easeOutCubic(clamp(age / ENTRY_ANIM_MS, 0, 1))
     const cx = t.bbox.x + t.bbox.w / 2
     const cy = t.bbox.y + t.bbox.h / 2
-    const dt = now - t.lastCenter.ts
+    const dt = Math.max(1, now - t.lastCenter.ts)
     const moveDist = Math.hypot(cx - t.lastCenter.x, cy - t.lastCenter.y)
-    if (moveDist > STILLNESS_MOVE_PX) t.stillSince = null
-    else if (t.stillSince === null) t.stillSince = now
     t.lastCenter = { x: cx, y: cy, ts: now }
 
-    if (t.prevTopY !== null && dt > 0) {
-      const dy = t.prevTopY - t.bbox.y
-      const speed = dy / dt * 1000
-      if (speed > 400) t.jumpBoost = Math.min(1, t.jumpBoost + 0.5)
-      else t.jumpBoost = Math.max(0, t.jumpBoost - 0.05)
+    // movement level (모드 무관 추적)
+    const speedNorm = clamp((moveDist / dt) * 30, 0, 1)
+    t.movementLevel = lerp(t.movementLevel, mode === 'move-music' ? speedNorm : 0, 0.1)
+
+    // 만료된 like/drop/skip 정리
+    if (t.likeBurstAt !== null && now - t.likeBurstAt > LIKE_BURST_MS) t.likeBurstAt = null
+    if (t.dropBurstAt !== null && now - t.dropBurstAt > DROP_BURST_MS) t.dropBurstAt = null
+    if (t.skipBurstAt !== null && now - t.skipBurstAt > SKIP_BURST_MS) t.skipBurstAt = null
+
+    // discoverLogos 만료
+    t.discoverLogos = t.discoverLogos.filter((d) => now - d.bornAt < d.ttl)
+
+    // togetherOffset 자연 복귀 (몸 모드에서만 끌어당김)
+    if (mode !== 'listen-together') {
+      t.togetherOffset.x = lerp(t.togetherOffset.x, 0, 0.12)
+      t.togetherOffset.y = lerp(t.togetherOffset.y, 0, 0.12)
     }
-    t.prevTopY = t.bbox.y
+    if (mode !== 'volume-up') t.handsUpLevel = lerp(t.handsUpLevel, 0, 0.1)
+    if (mode !== 'headphones') t.headphonesActive = false
+    if (mode !== 'group-sync') t.groupSyncHue = lerp(t.groupSyncHue, 0, 0.05)
 
-    let evadeTargetX = 0, evadeTargetY = 0
-    let handsUpTarget = 0
+    t.effectVisibility = lerp(t.effectVisibility, entryVis, 0.18)
+  }
 
-    if (mode === 'palm-hide' && gesture) {
-      if (palmCloseToTrack(gesture, t.bbox, vw, vh)) targetVis = 0
-    } else if (mode === 'stillness-boost') {
-      if (t.stillSince !== null && now - t.stillSince > STILLNESS_DWELL_MS) targetVis = entryVis
-      else targetVis = entryVis * 0.45
-    } else if (mode === 'evade' && gesture && gesture.landmarks) {
-      // 효과를 손에서 항상 최소 거리 유지하도록 강제로 밀어냄 (절대 안 닿음)
-      const anchor = effectAnchor(t, effect)
-      const baseX = anchor.cx
-      const baseY = anchor.cy
-      const currX = baseX + t.evadeOffset.x
-      const currY = baseY + t.evadeOffset.y
+  if (!gesture) return
 
-      let closest = Infinity
-      let pushX = 0, pushY = 0
-      for (const lm of gesture.landmarks) {
-        if (!lm?.length) continue
-        const wrist = lm[0]
-        const mid = lm[9] ?? lm[0]
-        const hx = ((wrist.x + mid.x) / 2) * vw
-        const hy = ((wrist.y + mid.y) / 2) * vh
-        const d = Math.hypot(hx - currX, hy - currY)
-        if (d < closest) {
-          closest = d
-          if (d < EVADE_MIN_DIST_PX) {
-            let dirX = currX - hx
-            let dirY = currY - hy
-            const len = Math.hypot(dirX, dirY)
-            if (len < 0.5) { dirX = 0; dirY = -1 } // 손 위에 정확히 겹쳤을 때 위로 도망
-            const nx = dirX / (len || 1)
-            const ny = dirY / (len || 1)
-            const newX = hx + nx * EVADE_MIN_DIST_PX
-            const newY = hy + ny * EVADE_MIN_DIST_PX
-            pushX = newX - baseX
-            pushY = newY - baseY
+  // hand 위치 리스트 (간단 swipe용으로 추적)
+  const handsNow: { x: number; y: number; ts: number; category?: string }[] = []
+  if (gesture.landmarks) {
+    for (let i = 0; i < gesture.landmarks.length; i++) {
+      const lm = gesture.landmarks[i]
+      if (!lm?.length) continue
+      const wrist = lm[0]
+      const cat = gesture.gestures?.[i]?.[0]?.categoryName
+      handsNow.push({ x: wrist.x * vw, y: wrist.y * vh, ts: now, category: cat })
+    }
+  }
+
+  // ─── volume-up
+  if (mode === 'volume-up') {
+    for (const t of tracks) {
+      let above = 0
+      const headLine = t.bbox.y + t.bbox.w * 0.1
+      for (const h of handsNow) {
+        if (handBelongsTo(h.x, h.y, t.bbox) && h.y < headLine) above++
+      }
+      t.handsUpLevel = lerp(t.handsUpLevel, Math.min(1, above / 2), 0.15)
+    }
+  }
+
+  // ─── tap-like
+  if (mode === 'tap-like') {
+    for (const t of tracks) {
+      for (const h of handsNow) {
+        if (h.category !== 'Thumb_Up') continue
+        if (!handBelongsTo(h.x, h.y, t.bbox)) continue
+        if (t.likeBurstAt === null || now - t.likeBurstAt > LIKE_BURST_MS) {
+          t.likeBurstAt = now
+        }
+      }
+    }
+  }
+
+  // ─── drop-beat
+  if (mode === 'drop-beat') {
+    for (const t of tracks) {
+      for (const h of handsNow) {
+        if (h.category !== 'Open_Palm') continue
+        if (!handBelongsTo(h.x, h.y, t.bbox)) continue
+        if (!t.dropBurstAt || now - t.dropBurstAt > 1200) t.dropBurstAt = now
+      }
+    }
+  }
+
+  // ─── skip-track (손 빠른 swipe)
+  if (mode === 'skip-track') {
+    for (const h of handsNow) {
+      // 가장 가까운 이전 손 위치 찾기
+      let bestDist = Infinity, bestPrev = null as typeof lastHandPos[number] | null
+      for (const p of lastHandPos) {
+        const d = Math.hypot(p.x - h.x, p.y - h.y)
+        if (d < bestDist) { bestDist = d; bestPrev = p }
+      }
+      if (bestPrev && bestDist < 200) {
+        const ddt = Math.max(1, now - bestPrev.ts)
+        const vx = (h.x - bestPrev.x) / ddt * 1000  // px/sec
+        if (Math.abs(vx) > 1000) {
+          const dir: -1 | 1 = vx > 0 ? 1 : -1
+          for (const t of tracks) {
+            if (handBelongsTo(h.x, h.y, t.bbox)) {
+              if (!t.skipBurstAt || now - t.skipBurstAt > SKIP_BURST_MS) {
+                t.skipBurstAt = now
+                t.skipDir = dir
+              }
+            }
           }
         }
       }
-      if (closest > EVADE_RELEASE_PX) { pushX = 0; pushY = 0 }
-      evadeTargetX = pushX
-      evadeTargetY = pushY
-      // push는 즉각, 복귀는 부드럽게
-      const k = (pushX !== 0 || pushY !== 0) ? 0.85 : 0.08
-      t.evadeOffset.x = lerp(t.evadeOffset.x, evadeTargetX, k)
-      t.evadeOffset.y = lerp(t.evadeOffset.y, evadeTargetY, k)
-    } else if (mode === 'magnet' && gesture && gesture.landmarks) {
-      // 손 가까이 오면 효과가 손 쪽으로 끌림
-      const anchor = effectAnchor(t, effect)
-      let bestDx = 0, bestDy = 0, bestPull = 0
-      for (const lm of gesture.landmarks) {
-        if (!lm?.length) continue
-        const wrist = lm[0]
-        const mid = lm[9] ?? lm[0]
-        const hx = ((wrist.x + mid.x) / 2) * vw
-        const hy = ((wrist.y + mid.y) / 2) * vh
-        const dx = hx - anchor.cx
-        const dy = hy - anchor.cy
-        const dist = Math.hypot(dx, dy)
-        if (dist < MAGNET_RANGE_PX) {
-          const pull = (MAGNET_RANGE_PX - dist) / MAGNET_RANGE_PX * 0.85
-          if (pull > bestPull) { bestPull = pull; bestDx = dx * pull; bestDy = dy * pull }
+    }
+  }
+  lastHandPos.length = 0
+  for (const h of handsNow) lastHandPos.push(h)
+
+  // ─── headphones
+  if (mode === 'headphones') {
+    for (const t of tracks) {
+      const headCx = t.bbox.x + t.bbox.w / 2
+      const headCy = t.bbox.y + t.bbox.w * 0.18
+      const yRange = t.bbox.w * 0.3
+      let left = false, right = false
+      for (const h of handsNow) {
+        if (!handBelongsTo(h.x, h.y, t.bbox)) continue
+        if (Math.abs(h.y - headCy) < yRange) {
+          if (h.x < headCx) left = true
+          if (h.x > headCx) right = true
         }
       }
-      t.evadeOffset.x = lerp(t.evadeOffset.x, bestDx, 0.25)
-      t.evadeOffset.y = lerp(t.evadeOffset.y, bestDy, 0.25)
-    } else if (mode === 'hands-up' && gesture && gesture.landmarks) {
-      // 양손이 머리 위에 있으면 효과가 커짐
-      let handsAbove = 0
-      const headLine = t.bbox.y + t.bbox.w * 0.2
-      for (const lm of gesture.landmarks) {
+      t.headphonesActive = left && right
+    }
+  }
+
+  // ─── discover
+  if (mode === 'discover') {
+    for (const t of tracks) {
+      for (let i = 0; i < (gesture.landmarks?.length ?? 0); i++) {
+        const cat = gesture.gestures?.[i]?.[0]?.categoryName
+        if (cat !== 'Pointing_Up') continue
+        const lm = gesture.landmarks[i]
         if (!lm?.length) continue
         const wrist = lm[0]
-        const hy = wrist.y * vh
-        if (hy < headLine) handsAbove++
+        const tip = lm[8]
+        const hx = wrist.x * vw, hy = wrist.y * vh
+        if (!handBelongsTo(hx, hy, t.bbox)) continue
+        if (now - t.lastDiscoverAt < 280) continue
+        // 손가락 방향으로 새 로고 생성
+        const dx = (tip.x - wrist.x) * vw
+        const dy = (tip.y - wrist.y) * vh
+        const len = Math.hypot(dx, dy) || 1
+        const nx = dx / len, ny = dy / len
+        const spawnX = (tip.x * vw) + nx * 60
+        const spawnY = (tip.y * vh) + ny * 60
+        t.discoverLogos.push({ x: spawnX, y: spawnY, bornAt: now, ttl: 1800 })
+        t.lastDiscoverAt = now
       }
-      handsUpTarget = handsAbove >= 2 ? 1 : 0
-      t.handsUpBoost = lerp(t.handsUpBoost, handsUpTarget, 0.12)
     }
+  }
 
-    if (mode !== 'evade' && mode !== 'magnet') {
-      // 위에서 처리 안한 모드일 때 evadeOffset 자연 복귀
-      t.evadeOffset.x = lerp(t.evadeOffset.x, 0, 0.15)
-      t.evadeOffset.y = lerp(t.evadeOffset.y, 0, 0.15)
+  // ─── listen-together
+  if (mode === 'listen-together' && tracks.length >= 2) {
+    for (const t of tracks) {
+      let bestPullX = 0, bestPullY = 0, bestDist = Infinity
+      const myAnchor = effectAnchor(t)
+      for (const o of tracks) {
+        if (o.id === t.id) continue
+        const otherAnchor = effectAnchor(o)
+        const dx = otherAnchor.cx - myAnchor.cx
+        const dy = otherAnchor.cy - myAnchor.cy
+        const dist = Math.hypot(dx, dy)
+        if (dist < TOGETHER_RANGE_PX && dist < bestDist) {
+          bestDist = dist
+          const pull = (TOGETHER_RANGE_PX - dist) / TOGETHER_RANGE_PX * 0.5
+          bestPullX = dx * pull
+          bestPullY = dy * pull
+        }
+      }
+      t.togetherOffset.x = lerp(t.togetherOffset.x, bestPullX, 0.18)
+      t.togetherOffset.y = lerp(t.togetherOffset.y, bestPullY, 0.18)
     }
-    if (mode !== 'hands-up') t.handsUpBoost = lerp(t.handsUpBoost, 0, 0.08)
-
-    const visK = mode === 'palm-hide' ? 0.27 : 0.13
-    t.effectVisibility = lerp(t.effectVisibility, targetVis, visK)
   }
-}
 
-function palmCloseToTrack(g: GestureRecognizerResult, bbox: BBox, vw: number, vh: number): boolean {
-  if (!g.gestures || !g.landmarks) return false
-  for (let i = 0; i < g.gestures.length; i++) {
-    const cat = g.gestures[i]?.[0]
-    if (!cat || cat.categoryName !== 'Open_Palm') continue
-    const lm = g.landmarks[i]
-    if (!lm?.length) continue
-    const wrist = lm[0]
-    const mid = lm[9] ?? lm[0]
-    const hx = ((wrist.x + mid.x) / 2) * vw
-    const hy = ((wrist.y + mid.y) / 2) * vh
-    const cx = bbox.x + bbox.w / 2
-    const cy = bbox.y + bbox.h / 2
-    if (Math.hypot(hx - cx, hy - cy) < bbox.w * PALM_PROXIMITY_RATIO) return true
+  // ─── group-sync (모든 트랙의 첫 손이 같은 카테고리면 글로벌 hue 변화)
+  if (mode === 'group-sync' && tracks.length >= 2) {
+    const cats = new Set<string>()
+    for (let i = 0; i < (gesture.gestures?.length ?? 0); i++) {
+      const c = gesture.gestures[i]?.[0]?.categoryName
+      if (c && c !== 'None') cats.add(c)
+    }
+    if (cats.size === 1 && handsNow.length >= 2) {
+      // 모든 손이 같은 제스처
+      const cat = Array.from(cats)[0]
+      const hueMap: Record<string, number> = {
+        'Open_Palm': 200,    // 파랑
+        'Closed_Fist': 0,    // 빨강
+        'Thumb_Up': 50,      // 노랑
+        'Victory': 280,      // 보라
+        'ILoveYou': 320,     // 핑크
+        'Pointing_Up': 130,  // 초록
+        'Thumb_Down': 30,    // 주황
+      }
+      const target = hueMap[cat] ?? 0
+      groupHueRef.current = lerp(groupHueRef.current, target, 0.08)
+      for (const t of tracks) t.groupSyncHue = groupHueRef.current
+    } else {
+      groupHueRef.current = lerp(groupHueRef.current, 0, 0.04)
+    }
   }
-  return false
 }
 
 // ─── 효과 렌더 ──────────────────────────────────────────
@@ -547,69 +644,263 @@ function drawEffect(
   ts: number,
   mirrored: boolean,
   fx: EffectType,
+  mode: InteractionMode,
 ) {
-  const anchor = effectAnchor(t, fx)
-  let cx = anchor.cx + t.evadeOffset.x
-  let cy = anchor.cy + t.evadeOffset.y
-  if (mirrored) cx = vw - cx
+  const anchor = effectAnchor(t)
+  const baseX = anchor.cx + t.togetherOffset.x
+  const baseY = anchor.cy + t.togetherOffset.y
+  let cx = mirrored ? vw - baseX : baseX
+  let cy = baseY
 
-  const jumpScale = 1 + t.jumpBoost * 0.6
-  const handsUpScale = 1 + t.handsUpBoost * 0.9
-
-  if (fx === 'spotify') {
-    const age = ts - t.effectStartedAt
-    const tt = clamp(age / SPOTIFY_ENTRY_MS, 0, 1)
-    // 세련된 등장: cubic ease-out scale + 살짝 회전 + fade
-    const entryScale = easeOutCubic(tt)
-    const entryRotation = (1 - easeOutQuint(tt)) * -0.5  // -0.5rad → 0
-    const entryAlpha = easeOutCubic(clamp(tt * 1.4, 0, 1))
-
-    // idle 애니메이션 (등장 후에도 계속 움직임)
-    const idleScale = 1 + Math.sin(ts / 1300 + t.id * 0.7) * 0.06
-    const floatX = Math.sin(ts / 1100 + t.id * 0.5) * anchor.headSize * 0.04
-    const floatY = Math.sin(ts / 900 + t.id) * anchor.headSize * 0.05
-    const idleRot = Math.sin(ts / 2400 + t.id * 0.3) * 0.10
-
-    const finalR = anchor.headSize * 0.1 * entryScale * idleScale * jumpScale * handsUpScale * t.effectVisibility
-    if (finalR < 0.5) return
-
+  // headphones는 위치 자체를 양 귀 옆으로 변경 — 일반 효과 대신 헤드폰 표시
+  if (mode === 'headphones' && t.headphonesActive) {
+    let lcx = t.bbox.x + t.bbox.w * 0.2
+    let rcx = t.bbox.x + t.bbox.w * 0.8
+    const ecy = t.bbox.y + t.bbox.w * 0.2
+    if (mirrored) { const tmp = lcx; lcx = vw - rcx; rcx = vw - tmp }
+    const r = anchor.headSize * 0.12 * t.effectVisibility
     ctx.save()
-    ctx.globalAlpha *= entryAlpha * t.effectVisibility
-    drawSpotifyLogo(ctx, cx + floatX, cy + floatY, finalR, entryRotation + idleRot)
+    ctx.globalAlpha *= t.effectVisibility
+    drawSpotifyLogo(ctx, lcx, ecy, r, 0)
+    drawSpotifyLogo(ctx, rcx, ecy, r, 0)
+    // 헤드밴드 라인
+    ctx.strokeStyle = SPOTIFY_GREEN
+    ctx.lineWidth = Math.max(2, r * 0.25)
+    ctx.beginPath()
+    ctx.moveTo(lcx, ecy)
+    ctx.bezierCurveTo(lcx + (rcx - lcx) * 0.3, ecy - r * 1.2, rcx - (rcx - lcx) * 0.3, ecy - r * 1.2, rcx, ecy)
+    ctx.stroke()
     ctx.restore()
+    drawExtras(ctx, t, anchor, vw, ts, mirrored, mode)
     return
   }
 
-  const scale = lerp(0.5, 1.0, t.effectVisibility) * jumpScale * handsUpScale
+  const age = ts - t.effectStartedAt
+  const entryT = clamp(age / SPOTIFY_ENTRY_MS, 0, 1)
+  const entryScale = easeOutCubic(entryT)
+  const entryRotation = (1 - easeOutQuint(entryT)) * -0.5
+  const entryAlpha = easeOutCubic(clamp(entryT * 1.4, 0, 1))
+
+  // 효과별 base 크기 (모든 효과가 spotify 로고 작은 크기 기준)
+  const baseR = anchor.headSize * 0.1
+
+  // interaction multipliers
+  const volMul = 1 + t.handsUpLevel * 1.5
+  const moveMul = mode === 'move-music' ? (1 + t.movementLevel * 1.2) : 1
+  const groupHue = t.groupSyncHue || 0
+
   ctx.save()
-  ctx.globalAlpha *= t.effectVisibility
-  ctx.globalCompositeOperation = 'screen'
-  switch (fx) {
-    case 'halo':      drawHalo(ctx, cx, cy, anchor.headSize * 1.1 * scale); break
-    case 'sequence':  drawSequenceFrame(ctx, cx, cy, anchor.headSize * 1.3 * scale, ts, t.id); break
-    case 'ring':      drawRing(ctx, cx, cy, anchor.headSize * 1.2 * scale, ts, t.id); break
-    case 'particles': drawParticles(ctx, cx, cy, anchor.headSize * 1.4 * scale, ts, t.id); break
+  ctx.globalAlpha *= entryAlpha * t.effectVisibility
+
+  // skip-track: 효과가 그 방향으로 슬라이드 아웃 + 색 변환 후 다시
+  let skipOffset = 0
+  let skipColorHueShift = 0
+  if (t.skipBurstAt !== null) {
+    const skipT = clamp((ts - t.skipBurstAt) / SKIP_BURST_MS, 0, 1)
+    const halfT = skipT < 0.5 ? skipT * 2 : (1 - skipT) * 2  // 0→1→0
+    skipOffset = halfT * 200 * t.skipDir
+    skipColorHueShift = skipT > 0.5 ? (skipT - 0.5) * 360 : 0
   }
+  ctx.translate(skipOffset, 0)
+
+  switch (fx) {
+    case 'pop': {
+      const float = Math.sin(ts / 1300 + t.id * 0.7) * baseR * 0.6
+      const rot = Math.sin(ts / 2400 + t.id * 0.3) * 0.10
+      const r = baseR * entryScale * volMul * moveMul
+      drawColoredLogo(ctx, cx + Math.sin(ts / 1100 + t.id * 0.5) * baseR * 0.3, cy + float, r, entryRotation + rot, groupHue + skipColorHueShift)
+      break
+    }
+    case 'bounce': {
+      const bpm = 0.5 * (1 + t.movementLevel * 0.5) // 빠른 움직임 → 더 빠른 비트
+      const period = 500 / bpm * 0.5
+      const beatT = ((ts % period) / period)
+      const bounceY = -Math.abs(Math.sin(beatT * Math.PI)) * baseR * 2.5
+      const squashY = 1 - Math.abs(Math.cos(beatT * Math.PI)) * 0.15
+      const r = baseR * entryScale * volMul
+      ctx.save()
+      ctx.translate(cx, cy + bounceY)
+      ctx.scale(1 / squashY, squashY) // squash & stretch
+      drawColoredLogo(ctx, 0, 0, r, entryRotation, groupHue + skipColorHueShift)
+      ctx.restore()
+      break
+    }
+    case 'orbit': {
+      const N = Math.max(3, Math.round(4 + t.handsUpLevel * 4))
+      const orbitR = anchor.headSize * (1.0 + t.movementLevel * 0.4) * entryScale
+      const rotSpeed = (1 + t.movementLevel * 1.0) / 2000
+      const r = baseR * 0.95 * entryScale * volMul
+      for (let i = 0; i < N; i++) {
+        const a = ts * rotSpeed + (i / N) * Math.PI * 2 + entryRotation
+        const px = cx + Math.cos(a) * orbitR
+        const py = cy + Math.sin(a) * orbitR * 0.6 // 약간 elliptical
+        drawColoredLogo(ctx, px, py, r, a + Math.PI / 2, groupHue + skipColorHueShift)
+      }
+      break
+    }
+    case 'multiply': {
+      const N = Math.max(6, Math.round(8 + t.handsUpLevel * 8 + t.movementLevel * 4))
+      const r = baseR * 0.85 * entryScale * volMul
+      for (let i = 0; i < N; i++) {
+        const seed = t.id * 17 + i * 31
+        const a = (seed % 100) / 100 * Math.PI * 2 + ts / 4000
+        const dist = anchor.headSize * (0.6 + ((seed * 7) % 100) / 100 * 0.9 + Math.sin(ts / 1500 + i) * 0.1)
+        const px = cx + Math.cos(a) * dist
+        const py = cy + Math.sin(a) * dist * 0.8
+        drawColoredLogo(ctx, px, py, r, Math.sin(ts / 900 + i) * 0.4, groupHue + skipColorHueShift)
+      }
+      break
+    }
+    case 'breathe': {
+      const breath = 1 + Math.sin(ts / 1800) * 0.25
+      const r = baseR * 1.5 * breath * entryScale * volMul
+      drawColoredLogo(ctx, cx, cy, r, entryRotation, groupHue + skipColorHueShift)
+      // 부드러운 후광
+      ctx.save()
+      ctx.globalCompositeOperation = 'screen'
+      ctx.globalAlpha *= 0.3
+      const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r * 2.5)
+      grad.addColorStop(0, hueShifted('rgba(29,185,84,0.7)', groupHue + skipColorHueShift))
+      grad.addColorStop(1, 'rgba(29,185,84,0)')
+      ctx.fillStyle = grad
+      ctx.beginPath(); ctx.arc(cx, cy, r * 2.5, 0, Math.PI * 2); ctx.fill()
+      ctx.restore()
+      break
+    }
+    case 'pulse': {
+      // 중앙 로고
+      const r = baseR * entryScale * volMul
+      drawColoredLogo(ctx, cx, cy, r, entryRotation, groupHue + skipColorHueShift)
+      // 동심원 음파 (3겹, phase 다름)
+      const PULSE_PERIOD = 1500
+      ctx.save()
+      ctx.lineWidth = 3
+      for (let i = 0; i < 3; i++) {
+        const phase = (((ts + (i * PULSE_PERIOD) / 3) % PULSE_PERIOD) / PULSE_PERIOD)
+        const ringR = phase * anchor.headSize * (1.6 + t.movementLevel * 0.6)
+        const a = 1 - phase
+        ctx.globalAlpha = a * t.effectVisibility * entryAlpha * 0.7
+        ctx.strokeStyle = hueShifted(SPOTIFY_GREEN, groupHue + skipColorHueShift)
+        ctx.beginPath(); ctx.arc(cx, cy, ringR, 0, Math.PI * 2); ctx.stroke()
+      }
+      ctx.restore()
+      break
+    }
+  }
+
+  ctx.restore()
+
+  drawExtras(ctx, t, anchor, vw, ts, mirrored, mode)
+}
+
+function drawExtras(
+  ctx: CanvasRenderingContext2D,
+  t: Track,
+  anchor: ReturnType<typeof effectAnchor>,
+  vw: number,
+  ts: number,
+  mirrored: boolean,
+  mode: InteractionMode,
+) {
+  let cx = anchor.cx + t.togetherOffset.x
+  if (mirrored) cx = vw - cx
+  const cy = anchor.cy + t.togetherOffset.y
+
+  // tap-like — 하트 + "+1" 위로 떠오름
+  if (mode === 'tap-like' && t.likeBurstAt !== null) {
+    const lt = (ts - t.likeBurstAt) / LIKE_BURST_MS
+    const yRise = -lt * anchor.headSize * 0.6
+    const alpha = 1 - lt
+    ctx.save()
+    ctx.globalAlpha *= alpha
+    drawHeart(ctx, cx, cy + yRise, anchor.headSize * 0.12)
+    ctx.font = 'bold 16px ui-monospace, monospace'
+    ctx.fillStyle = '#ff5e9c'
+    ctx.textAlign = 'center'
+    ctx.fillText('+1', cx + anchor.headSize * 0.18, cy + yRise - anchor.headSize * 0.05)
+    ctx.restore()
+  }
+
+  // drop-beat — 폭발 확산 로고들
+  if (mode === 'drop-beat' && t.dropBurstAt !== null) {
+    const lt = (ts - t.dropBurstAt) / DROP_BURST_MS
+    const r = baseDropRadius(anchor.headSize, lt)
+    const alpha = 1 - lt
+    ctx.save()
+    ctx.globalAlpha *= alpha
+    const N = 10
+    for (let i = 0; i < N; i++) {
+      const a = (i / N) * Math.PI * 2
+      const px = cx + Math.cos(a) * r
+      const py = cy + Math.sin(a) * r
+      drawSpotifyLogo(ctx, px, py, anchor.headSize * 0.08 * (1 - lt * 0.5), 0)
+    }
+    ctx.restore()
+  }
+
+  // discover — 손가락 가리킨 곳에 로고들
+  if (mode === 'discover') {
+    for (const d of t.discoverLogos) {
+      const lt = (ts - d.bornAt) / d.ttl
+      const alpha = lt < 0.2 ? (lt / 0.2) : (1 - (lt - 0.2) / 0.8)
+      ctx.save()
+      ctx.globalAlpha *= clamp(alpha, 0, 1) * t.effectVisibility
+      const dx = mirrored ? vw - d.x : d.x
+      drawSpotifyLogo(ctx, dx, d.y, anchor.headSize * 0.08, 0)
+      ctx.restore()
+    }
+  }
+}
+
+function baseDropRadius(headSize: number, t: number) {
+  return easeOutCubic(t) * headSize * 1.5
+}
+
+function drawHeart(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number) {
+  ctx.save()
+  ctx.translate(cx, cy)
+  ctx.scale(r / 12, r / 12)
+  ctx.fillStyle = '#ff5e9c'
+  ctx.beginPath()
+  ctx.moveTo(0, 4)
+  ctx.bezierCurveTo(0, -2, -8, -6, -8, 0)
+  ctx.bezierCurveTo(-8, 4, 0, 9, 0, 12)
+  ctx.bezierCurveTo(0, 9, 8, 4, 8, 0)
+  ctx.bezierCurveTo(8, -6, 0, -2, 0, 4)
+  ctx.fill()
   ctx.restore()
 }
 
+function drawColoredLogo(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, rotation: number, hueShift: number) {
+  if (r < 0.5) return
+  ctx.save()
+  if (hueShift !== 0) {
+    ctx.filter = `hue-rotate(${hueShift}deg)`
+  }
+  drawSpotifyLogo(ctx, cx, cy, r, rotation)
+  ctx.restore()
+}
+
+function hueShifted(color: string, hueShift: number): string {
+  if (hueShift === 0) return color
+  // 단순 hsl 변환: hex/RGB → HSL → hueShift → RGB
+  // 여기선 간단히 hsl shift된 spotify color 근사
+  const baseHue = 141  // Spotify green base
+  const newHue = (baseHue + hueShift) % 360
+  return `hsl(${newHue}, 73%, 42%)`
+}
+
 function drawSpotifyLogo(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, rotation = 0) {
-  if (r < 1) return
+  if (r < 0.5) return
   ctx.save()
   ctx.translate(cx, cy)
   ctx.rotate(rotation)
-
-  ctx.shadowColor = 'rgba(0,0,0,0.4)'
-  ctx.shadowBlur = r * 0.5
-  ctx.shadowOffsetY = r * 0.12
-
-  ctx.fillStyle = '#1DB954'
-  ctx.beginPath()
-  ctx.arc(0, 0, r, 0, Math.PI * 2)
-  ctx.fill()
-  ctx.shadowBlur = 0
-  ctx.shadowOffsetY = 0
-
+  ctx.shadowColor = 'rgba(0,0,0,0.35)'
+  ctx.shadowBlur = r * 0.4
+  ctx.shadowOffsetY = r * 0.1
+  ctx.fillStyle = SPOTIFY_GREEN
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.fill()
+  ctx.shadowBlur = 0; ctx.shadowOffsetY = 0
   ctx.strokeStyle = '#fff'
   ctx.lineCap = 'round'
   const bars = [
@@ -627,77 +918,14 @@ function drawSpotifyLogo(ctx: CanvasRenderingContext2D, cx: number, cy: number, 
   ctx.restore()
 }
 
-function drawHalo(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number) {
-  const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r)
-  grad.addColorStop(0, 'rgba(255, 230, 130, 0.95)')
-  grad.addColorStop(0.45, 'rgba(255, 170, 60, 0.5)')
-  grad.addColorStop(1, 'rgba(255, 80, 0, 0)')
-  ctx.fillStyle = grad
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill()
-}
-
-function drawSequenceFrame(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, ts: number, seed: number) {
-  const FRAMES = 24, PERIOD_MS = 1600
-  const frame = Math.floor(((ts + seed * 137) % PERIOD_MS) / PERIOD_MS * FRAMES)
-  const phase = (frame / FRAMES) * Math.PI * 2
-  const pulse = 0.85 + 0.15 * Math.sin(phase * 2)
-  const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r * pulse)
-  grad.addColorStop(0, 'rgba(180, 230, 255, 0.85)')
-  grad.addColorStop(0.5, 'rgba(120, 180, 255, 0.5)')
-  grad.addColorStop(1, 'rgba(80, 120, 255, 0)')
-  ctx.fillStyle = grad
-  ctx.beginPath(); ctx.arc(cx, cy, r * pulse, 0, Math.PI * 2); ctx.fill()
-  const N = 6
-  for (let i = 0; i < N; i++) {
-    const a = phase + (i / N) * Math.PI * 2
-    const px = cx + Math.cos(a) * r * 0.7
-    const py = cy + Math.sin(a) * r * 0.7
-    const sr = r * 0.18 * (0.7 + 0.3 * Math.sin(phase * 3 + i))
-    const g2 = ctx.createRadialGradient(px, py, 0, px, py, sr)
-    g2.addColorStop(0, 'rgba(255, 250, 200, 0.95)')
-    g2.addColorStop(1, 'rgba(255, 200, 100, 0)')
-    ctx.fillStyle = g2
-    ctx.beginPath(); ctx.arc(px, py, sr, 0, Math.PI * 2); ctx.fill()
-  }
-}
-
-function drawRing(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, ts: number, seed: number) {
-  const rot = (ts / 1200 + seed * 0.7) % (Math.PI * 2)
-  ctx.lineWidth = Math.max(3, r * 0.06)
-  for (let i = 0; i < 3; i++) {
-    const a0 = rot + (i / 3) * Math.PI * 2
-    const a1 = a0 + Math.PI * 0.5
-    ctx.strokeStyle = `hsla(${(seed * 67 + i * 30) % 360}, 90%, 70%, 0.85)`
-    ctx.beginPath(); ctx.arc(cx, cy, r * (0.95 - i * 0.08), a0, a1); ctx.stroke()
-  }
-}
-
-function drawParticles(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, ts: number, seed: number) {
-  const N = 14
-  for (let i = 0; i < N; i++) {
-    const base = (i / N) * Math.PI * 2
-    const a = base + ts / 900 * (i % 2 === 0 ? 1 : -1)
-    const radius = r * (0.5 + 0.5 * (0.6 + 0.4 * Math.sin(ts / 700 + i)))
-    const px = cx + Math.cos(a) * radius
-    const py = cy + Math.sin(a) * radius
-    const sr = r * 0.08
-    const grad = ctx.createRadialGradient(px, py, 0, px, py, sr)
-    grad.addColorStop(0, `hsla(${(seed * 23 + i * 25 + ts / 30) % 360}, 95%, 75%, 0.9)`)
-    grad.addColorStop(1, 'rgba(255,255,255,0)')
-    ctx.fillStyle = grad
-    ctx.beginPath(); ctx.arc(px, py, sr, 0, Math.PI * 2); ctx.fill()
-  }
-}
-
 // ─── 시각화 ─────────────────────────────────────────────
 
 function drawBBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirrored: boolean) {
   let x = t.bbox.x
   if (mirrored) x = vw - t.bbox.x - t.bbox.w
   const { y, w, h } = t.bbox
-  const color = colorForId(t.id)
   ctx.save()
-  ctx.strokeStyle = color
+  ctx.strokeStyle = colorForId(t.id)
   ctx.lineWidth = 3
   ctx.strokeRect(x, y, w, h)
   ctx.restore()
@@ -709,7 +937,6 @@ function drawHeadLabel(ctx: CanvasRenderingContext2D, t: Track, displayNum: numb
   const yTop = Math.max(28, t.bbox.y)
   const color = colorForId(t.id)
   const label = `#${displayNum}  ${(t.score * 100).toFixed(0)}%`
-
   ctx.save()
   ctx.font = 'bold 18px ui-monospace, Menlo, monospace'
   ctx.textAlign = 'center'
@@ -735,7 +962,7 @@ function drawSilhouette(
   vw: number,
   vh: number,
   mirrored: boolean,
-  side: 'bg' | 'fg',
+  mode: ShapeMode,
 ) {
   const mask = seg.categoryMask
   if (!mask) return
@@ -746,31 +973,68 @@ function drawSilhouette(
   off.width = w; off.height = h
   const offCtx = off.getContext('2d')!
   const img = offCtx.createImageData(w, h)
-  const targetIsZero = side === 'bg'
-  const baseR = side === 'bg' ? 0 : 255
-  const baseG = side === 'bg' ? 255 : 120
-  const baseB = side === 'bg' ? 200 : 60
-  for (let i = 0; i < data.length; i++) {
-    const v = data[i]
-    const matches = targetIsZero ? (v === 0) : (v !== 0)
-    const o = i * 4
-    if (matches) {
-      img.data[o] = baseR; img.data[o + 1] = baseG; img.data[o + 2] = baseB; img.data[o + 3] = 120
-    } else {
-      img.data[o] = 0; img.data[o + 1] = 0; img.data[o + 2] = 0; img.data[o + 3] = 0
+
+  // person/배경 판정 — selfie_segmenter는 일반적으로 person이 0
+  const isPersonFn = (v: number) => v === 0
+
+  if (mode === 'silhouette-outline') {
+    // 윤곽선만 — 인접 셀과 다르면 outline
+    const baseR = 255, baseG = 60, baseB = 60
+    for (let yy = 0; yy < h; yy++) {
+      for (let xx = 0; xx < w; xx++) {
+        const i = yy * w + xx
+        const p = isPersonFn(data[i])
+        let isEdge = false
+        if (xx > 0 && isPersonFn(data[i - 1]) !== p) isEdge = true
+        else if (xx < w - 1 && isPersonFn(data[i + 1]) !== p) isEdge = true
+        else if (yy > 0 && isPersonFn(data[i - w]) !== p) isEdge = true
+        else if (yy < h - 1 && isPersonFn(data[i + w]) !== p) isEdge = true
+        const o = i * 4
+        if (isEdge) {
+          img.data[o] = baseR; img.data[o + 1] = baseG; img.data[o + 2] = baseB; img.data[o + 3] = 230
+        } else {
+          img.data[o] = 0; img.data[o + 1] = 0; img.data[o + 2] = 0; img.data[o + 3] = 0
+        }
+      }
+    }
+  } else {
+    const targetIsPerson = mode === 'silhouette-fg'
+    const baseR = targetIsPerson ? 255 : 0
+    const baseG = targetIsPerson ? 120 : 255
+    const baseB = targetIsPerson ? 60 : 200
+    for (let i = 0; i < data.length; i++) {
+      const v = data[i]
+      const matches = targetIsPerson ? isPersonFn(v) : !isPersonFn(v)
+      const o = i * 4
+      if (matches) {
+        img.data[o] = baseR; img.data[o + 1] = baseG; img.data[o + 2] = baseB; img.data[o + 3] = 120
+      } else {
+        img.data[o] = 0; img.data[o + 1] = 0; img.data[o + 2] = 0; img.data[o + 3] = 0
+      }
     }
   }
   offCtx.putImageData(img, 0, 0)
+
   ctx.save()
   if (mirrored) { ctx.translate(vw, 0); ctx.scale(-1, 1) }
-  ctx.globalCompositeOperation = 'screen'
-  ctx.drawImage(off, 0, 0, vw, vh)
-  if (side === 'fg') {
-    ctx.globalCompositeOperation = 'source-over'
-    ctx.shadowColor = `rgba(${baseR}, ${baseG}, ${baseB}, 0.9)`
-    ctx.shadowBlur = 16
+  if (mode === 'silhouette-outline') {
+    // outline은 stroke처럼 보이도록 살짝 두께 + glow
+    ctx.shadowColor = 'rgba(255, 80, 80, 0.9)'
+    ctx.shadowBlur = 6
+    ctx.drawImage(off, 0, 0, vw, vh)
+    // 한 번 더 그려서 두께
     ctx.drawImage(off, 0, 0, vw, vh)
     ctx.shadowBlur = 0
+  } else {
+    ctx.globalCompositeOperation = 'screen'
+    ctx.drawImage(off, 0, 0, vw, vh)
+    if (mode === 'silhouette-fg') {
+      ctx.globalCompositeOperation = 'source-over'
+      ctx.shadowColor = 'rgba(255, 120, 60, 0.9)'
+      ctx.shadowBlur = 16
+      ctx.drawImage(off, 0, 0, vw, vh)
+      ctx.shadowBlur = 0
+    }
   }
   ctx.restore()
 }
@@ -778,7 +1042,7 @@ function drawSilhouette(
 const COLORS = ['#7ee', '#ff7', '#f7f', '#7f7', '#f77', '#77f', '#fa7', '#7fa', '#a7f', '#f7a']
 function colorForId(id: number): string { return COLORS[id % COLORS.length] }
 
-// ─── UI: status overlay (English text only) ─────────────
+// ─── UI ──────────────────────────────────────────────────
 
 function StatusOverlay(props: { status: Status; errorMsg: string; fps: number; trackCount: number }) {
   const { status, errorMsg, fps, trackCount } = props
@@ -806,8 +1070,6 @@ function StatusOverlay(props: { status: Status; errorMsg: string; fps: number; t
   )
 }
 
-// ─── UI: bottom panel ───────────────────────────────────
-
 function BottomPanel(props: {
   open: boolean
   toggle: () => void
@@ -824,27 +1086,19 @@ function BottomPanel(props: {
       {open && (
         <div style={panelStyle}>
           <Row label="Display">
-            <Toggle on={shape === 'none'} onClick={() => setShape('none')}>None</Toggle>
-            <Toggle on={shape === 'box'} onClick={() => setShape('box')}>Box</Toggle>
-            <Toggle on={shape === 'silhouette-bg'} onClick={() => setShape('silhouette-bg')}>Silhouette-bg</Toggle>
-            <Toggle on={shape === 'silhouette-fg'} onClick={() => setShape('silhouette-fg')}>Silhouette-fg</Toggle>
+            {(['none', 'box', 'silhouette-bg', 'silhouette-fg', 'silhouette-outline'] as ShapeMode[]).map((s) => (
+              <Toggle key={s} on={shape === s} onClick={() => setShape(s)}>{shapeLabel(s)}</Toggle>
+            ))}
           </Row>
           <Row label="Effect">
-            <Toggle on={effect === 'none'} onClick={() => setEffect('none')}>None</Toggle>
-            <Toggle on={effect === 'spotify'} onClick={() => setEffect('spotify')}>Spotify</Toggle>
-            <Toggle on={effect === 'halo'} onClick={() => setEffect('halo')}>Halo</Toggle>
-            <Toggle on={effect === 'sequence'} onClick={() => setEffect('sequence')}>Sequence</Toggle>
-            <Toggle on={effect === 'ring'} onClick={() => setEffect('ring')}>Ring</Toggle>
-            <Toggle on={effect === 'particles'} onClick={() => setEffect('particles')}>Particles</Toggle>
+            {(['none', 'pop', 'bounce', 'orbit', 'multiply', 'breathe', 'pulse'] as EffectType[]).map((e) => (
+              <Toggle key={e} on={effect === e} onClick={() => setEffect(e)}>{effectLabel(e)}</Toggle>
+            ))}
           </Row>
           <Row label="Interaction">
-            <Toggle on={interaction === 'none'} onClick={() => setInteraction('none')}>None</Toggle>
-            <Toggle on={interaction === 'palm-hide'} onClick={() => setInteraction('palm-hide')}>Palm hide</Toggle>
-            <Toggle on={interaction === 'stillness-boost'} onClick={() => setInteraction('stillness-boost')}>Stillness</Toggle>
-            <Toggle on={interaction === 'jump-grow'} onClick={() => setInteraction('jump-grow')}>Jump</Toggle>
-            <Toggle on={interaction === 'evade'} onClick={() => setInteraction('evade')}>Evade</Toggle>
-            <Toggle on={interaction === 'magnet'} onClick={() => setInteraction('magnet')}>Magnet</Toggle>
-            <Toggle on={interaction === 'hands-up'} onClick={() => setInteraction('hands-up')}>Hands up</Toggle>
+            {(['none', 'move-music', 'volume-up', 'tap-like', 'listen-together', 'drop-beat', 'skip-track', 'headphones', 'discover', 'group-sync'] as InteractionMode[]).map((m) => (
+              <Toggle key={m} on={interaction === m} onClick={() => setInteraction(m)}>{interactionLabel(m)}</Toggle>
+            ))}
           </Row>
         </div>
       )}
@@ -853,6 +1107,27 @@ function BottomPanel(props: {
       </button>
     </div>
   )
+}
+
+function shapeLabel(s: ShapeMode): string {
+  return ({ 'none': 'None', 'box': 'Box', 'silhouette-bg': 'Silhouette-bg', 'silhouette-fg': 'Silhouette-fg', 'silhouette-outline': 'Outline' } as const)[s]
+}
+function effectLabel(e: EffectType): string {
+  return ({ 'none': 'None', 'pop': 'Pop', 'bounce': 'Bounce', 'orbit': 'Orbit', 'multiply': 'Multiply', 'breathe': 'Breathe', 'pulse': 'Pulse' } as const)[e]
+}
+function interactionLabel(m: InteractionMode): string {
+  return ({
+    'none': 'None',
+    'move-music': 'Move',
+    'volume-up': 'Volume',
+    'tap-like': 'Like',
+    'listen-together': 'Together',
+    'drop-beat': 'Drop',
+    'skip-track': 'Skip',
+    'headphones': 'Headphones',
+    'discover': 'Discover',
+    'group-sync': 'Sync',
+  } as const)[m]
 }
 
 function FullscreenButton({ isFullscreen }: { isFullscreen: boolean }) {
@@ -879,20 +1154,14 @@ function SparkleIcon() {
 function FullscreenEnterIcon() {
   return (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M4 9 V4 H9" />
-      <path d="M20 9 V4 H15" />
-      <path d="M4 15 V20 H9" />
-      <path d="M20 15 V20 H15" />
+      <path d="M4 9 V4 H9" /><path d="M20 9 V4 H15" /><path d="M4 15 V20 H9" /><path d="M20 15 V20 H15" />
     </svg>
   )
 }
 function FullscreenExitIcon() {
   return (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M9 4 V9 H4" />
-      <path d="M15 4 V9 H20" />
-      <path d="M9 20 V15 H4" />
-      <path d="M15 20 V15 H20" />
+      <path d="M9 4 V9 H4" /><path d="M15 4 V9 H20" /><path d="M9 20 V15 H4" /><path d="M15 20 V15 H20" />
     </svg>
   )
 }
@@ -938,7 +1207,7 @@ const bottomWrapStyle: React.CSSProperties = {
 }
 const panelStyle: React.CSSProperties = {
   display: 'flex', flexDirection: 'column', gap: 8,
-  fontSize: 13, maxWidth: 'min(620px, calc(100vw - 28px))', alignItems: 'flex-start',
+  fontSize: 13, maxWidth: 'min(720px, calc(100vw - 28px))', alignItems: 'flex-start',
 }
 const rowStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
@@ -950,19 +1219,19 @@ const rowChildrenStyle: React.CSSProperties = {
   display: 'flex', flexWrap: 'wrap', gap: 6,
 }
 const toggleStyle = (on: boolean): React.CSSProperties => ({
-  background: on ? 'rgba(126,238,238,0.18)' : 'rgba(255,255,255,0.04)',
-  border: `1px solid ${on ? 'rgba(126,238,238,0.7)' : 'rgba(255,255,255,0.25)'}`,
+  background: on ? 'rgba(29,185,84,0.22)' : 'rgba(255,255,255,0.04)',
+  border: `1px solid ${on ? 'rgba(29,185,84,0.8)' : 'rgba(255,255,255,0.25)'}`,
   color: '#fff', padding: '4px 10px', borderRadius: 6, cursor: 'pointer',
   fontSize: 12, fontFamily: 'inherit', textShadow: '0 1px 2px rgba(0,0,0,0.6)',
 })
 const fabStyle = (open: boolean): React.CSSProperties => ({
   width: 48, height: 48, borderRadius: '50%',
-  border: `1px solid ${open ? 'rgba(126,238,238,0.7)' : 'rgba(255,255,255,0.4)'}`,
-  background: open ? 'rgba(126,238,238,0.18)' : 'rgba(0,0,0,0.55)',
+  border: `1px solid ${open ? 'rgba(29,185,84,0.7)' : 'rgba(255,255,255,0.4)'}`,
+  background: open ? 'rgba(29,185,84,0.18)' : 'rgba(0,0,0,0.55)',
   backdropFilter: 'blur(8px)',
   color: '#fff', cursor: 'pointer', padding: 0,
   display: 'flex', alignItems: 'center', justifyContent: 'center',
-  boxShadow: open ? '0 0 16px rgba(126,238,238,0.5)' : '0 2px 8px rgba(0,0,0,0.5)',
+  boxShadow: open ? '0 0 16px rgba(29,185,84,0.5)' : '0 2px 8px rgba(0,0,0,0.5)',
 })
 const fsBtnStyle: React.CSSProperties = {
   position: 'fixed', right: 16, bottom: 16, zIndex: 11,
@@ -973,3 +1242,6 @@ const fsBtnStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', justifyContent: 'center',
   boxShadow: '0 2px 8px rgba(0,0,0,0.5)', transition: 'opacity 200ms',
 }
+
+// 사용 안되는 const 경고 회피
+void HEAD_DIST_NEAR_X
