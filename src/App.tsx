@@ -32,6 +32,8 @@ const TOGETHER_RANGE_PX = 320
 const HEAD_DIST_NEAR_X = 0.4    // bbox 중심 거리/평균 bbox.w 이하 시 가까움
 const MASK_REFRESH_MS = 60      // 실루엣 마스크 재계산 주기 (≈16fps, 표시는 60fps 유지)
 const GESTURE_REFRESH_MS = 50   // 인터랙션 사용 시 손 추적 주기 (≈20fps)
+const OBJECT_REFRESH_MS = 25    // ObjectDetector 호출 주기 (≈40fps). EMA로 중간 프레임 보간
+const FPS_UPDATE_MS = 500       // FPS 카운터 state 갱신 주기 — 매 프레임 setState 방지
 const SPOTIFY_GREEN = '#1DB954'
 
 // 공식 Spotify 아이콘 SVG (viewBox 168×168). 한 번만 Image로 디코딩해서 캐싱
@@ -110,6 +112,8 @@ export default function App() {
   const nextIdRef = useRef(1)
   const lastGestureRef = useRef<GestureRecognizerResult | null>(null)
   const lastGestureTsRef = useRef(0)
+  const lastObjectTsRef = useRef(0)
+  const fpsLastUpdateRef = useRef(0)
   const lastSegMaskRef = useRef<ImageSegmenterResult | null>(null)
   const silhouetteCacheRef = useRef<{ canvas: HTMLCanvasElement; shape: ShapeMode; ts: number } | null>(null)
   // skip-track 용 손 이전 위치 추적
@@ -185,7 +189,7 @@ export default function App() {
 
         setStatus('requesting-camera')
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 }, facingMode: 'user' },
           audio: false,
         })
         if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return }
@@ -200,9 +204,11 @@ export default function App() {
           const dt = now - lastTs
           lastTs = now
           if (dt > 0) { fpsBuf.push(1000 / dt); if (fpsBuf.length > 30) fpsBuf.shift() }
-          if (fpsBuf.length === 30) {
+          // FPS state는 500ms마다만 갱신 — 매 프레임 setState 방지
+          if (fpsBuf.length === 30 && now - fpsLastUpdateRef.current >= FPS_UPDATE_MS) {
             const avg = fpsBuf.reduce((a, b) => a + b, 0) / fpsBuf.length
             setFps(Math.round(avg))
+            fpsLastUpdateRef.current = now
           }
           detectAndRender(now)
           raf = requestAnimationFrame(loop)
@@ -252,20 +258,24 @@ export default function App() {
     ctx.drawImage(video, 0, 0, vw, vh)
     ctx.restore()
 
-    let objResult: ObjectDetectorResult | undefined
-    try { objResult = detector.detectForVideo(video, ts) } catch { return }
-    const detections: { bbox: BBox; score: number }[] = []
-    if (objResult) {
-      for (const d of objResult.detections) {
-        const c = d.categories?.[0]
-        if (!c || c.categoryName !== 'person' || c.score < SCORE_THRESHOLD) continue
-        const b = d.boundingBox
-        if (!b) continue
-        detections.push({ bbox: { x: b.originX, y: b.originY, w: b.width, h: b.height }, score: c.score })
+    // ObjectDetector throttle (≈40fps). 중간 프레임은 기존 트랙 사용 — EMA로 충분히 부드러움
+    if (ts - lastObjectTsRef.current >= OBJECT_REFRESH_MS) {
+      let objResult: ObjectDetectorResult | undefined
+      try { objResult = detector.detectForVideo(video, ts) } catch { return }
+      const detections: { bbox: BBox; score: number }[] = []
+      if (objResult) {
+        for (const d of objResult.detections) {
+          const c = d.categories?.[0]
+          if (!c || c.categoryName !== 'person' || c.score < SCORE_THRESHOLD) continue
+          const b = d.boundingBox
+          if (!b) continue
+          detections.push({ bbox: { x: b.originX, y: b.originY, w: b.width, h: b.height }, score: c.score })
+        }
       }
+      updateTracks(tracksRef.current, detections, ts, nextIdRef)
+      lastObjectTsRef.current = ts
+      if (tracksRef.current.length !== trackCount) setTrackCount(tracksRef.current.length)
     }
-    updateTracks(tracksRef.current, detections, ts, nextIdRef)
-    if (tracksRef.current.length !== trackCount) setTrackCount(tracksRef.current.length)
 
     // GestureRecognizer는 인터랙션이 손을 쓰는 모드일 때만 실행 (가장 비싼 모델)
     // 또한 throttle: 50ms마다 (≈20fps) — 손동작 인식엔 충분
