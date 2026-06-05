@@ -983,17 +983,24 @@ function drawSilhouette(
   const isPersonFn = (v: number) => v === 0
 
   if (mode === 'silhouette-outline') {
-    // 윤곽선만 — 인접 셀과 다르면 outline
+    // 윤곽선 — 두꺼운 stroke 만들기 위해 반경 3까지의 이웃 비교(dilation 효과)
     const baseR = 255, baseG = 60, baseB = 60
+    const radius = 3
     for (let yy = 0; yy < h; yy++) {
       for (let xx = 0; xx < w; xx++) {
         const i = yy * w + xx
         const p = isPersonFn(data[i])
         let isEdge = false
-        if (xx > 0 && isPersonFn(data[i - 1]) !== p) isEdge = true
-        else if (xx < w - 1 && isPersonFn(data[i + 1]) !== p) isEdge = true
-        else if (yy > 0 && isPersonFn(data[i - w]) !== p) isEdge = true
-        else if (yy < h - 1 && isPersonFn(data[i + w]) !== p) isEdge = true
+        for (let dy = -radius; dy <= radius && !isEdge; dy++) {
+          const ny = yy + dy
+          if (ny < 0 || ny >= h) continue
+          for (let dx = -radius; dx <= radius && !isEdge; dx++) {
+            if (dx === 0 && dy === 0) continue
+            const nx = xx + dx
+            if (nx < 0 || nx >= w) continue
+            if (isPersonFn(data[ny * w + nx]) !== p) isEdge = true
+          }
+        }
         const o = i * 4
         if (isEdge) {
           img.data[o] = baseR; img.data[o + 1] = baseG; img.data[o + 2] = baseB; img.data[o + 3] = 230
@@ -1023,13 +1030,18 @@ function drawSilhouette(
   ctx.save()
   if (mirrored) { ctx.translate(vw, 0); ctx.scale(-1, 1) }
   if (mode === 'silhouette-outline') {
-    // outline은 stroke처럼 보이도록 살짝 두께 + glow
-    ctx.shadowColor = 'rgba(255, 80, 80, 0.9)'
-    ctx.shadowBlur = 6
+    // 1) 부드러운 외곽 글로우 (큰 블러)
+    ctx.imageSmoothingEnabled = true
+    ctx.imageSmoothingQuality = 'high'
+    ctx.shadowColor = 'transparent'
+    ctx.filter = 'blur(10px)'
+    ctx.globalCompositeOperation = 'lighter'
     ctx.drawImage(off, 0, 0, vw, vh)
-    // 한 번 더 그려서 두께
+    // 2) 또렷한 안쪽 outline (작은 블러 — 지글거림 제거)
+    ctx.filter = 'blur(2.5px)'
     ctx.drawImage(off, 0, 0, vw, vh)
-    ctx.shadowBlur = 0
+    ctx.filter = 'none'
+    ctx.globalCompositeOperation = 'source-over'
   } else {
     ctx.globalCompositeOperation = 'screen'
     ctx.drawImage(off, 0, 0, vw, vh)
