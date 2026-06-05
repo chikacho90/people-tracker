@@ -906,20 +906,28 @@ function drawSpotifyLogo(ctx: CanvasRenderingContext2D, cx: number, cy: number, 
   ctx.save()
   ctx.translate(cx, cy)
   if (rotation) ctx.rotate(rotation)
-  // SVG의 막대 부분은 cutout이라 투명함 → 흰 원을 깔아 가운데를 흰색으로 채움.
-  // 그림자는 솔리드한 흰 원에만 적용해서 외곽에 깔끔한 drop shadow 만듦.
+
+  // Layer 1: 녹색 base 디스크 — 외곽 drop shadow 단일 솔리드 도형에만 적용 → 깔끔한 그림자
   ctx.shadowColor = 'rgba(0,0,0,0.35)'
-  ctx.shadowBlur = r * 0.4
-  ctx.shadowOffsetY = r * 0.1
-  ctx.fillStyle = '#fff'
+  ctx.shadowBlur = r * 0.3
+  ctx.shadowOffsetY = r * 0.08
+  ctx.fillStyle = SPOTIFY_GREEN
   ctx.beginPath()
   ctx.arc(0, 0, r, 0, Math.PI * 2)
   ctx.fill()
-  // 그림자 끔 후 SVG 오버레이
   ctx.shadowColor = 'transparent'
   ctx.shadowBlur = 0
   ctx.shadowOffsetY = 0
+
+  // Layer 2: 흰 내부 (SVG cutout 막대 채움). 외곽보다 충분히 작아 가장자리에 흰 띠 생기지 않음
+  ctx.fillStyle = '#fff'
+  ctx.beginPath()
+  ctx.arc(0, 0, r * 0.85, 0, Math.PI * 2)
+  ctx.fill()
+
+  // Layer 3: 공식 SVG 오버레이 (외곽 녹색 + 막대 cutout)
   ctx.drawImage(spotifyImage, -r, -r, r * 2, r * 2)
+
   ctx.restore()
 }
 
