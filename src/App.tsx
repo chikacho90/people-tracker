@@ -31,6 +31,7 @@ const SKIP_BURST_MS = 700
 const TOGETHER_RANGE_PX = 320
 const HEAD_DIST_NEAR_X = 0.4    // bbox 중심 거리/평균 bbox.w 이하 시 가까움
 const MASK_REFRESH_MS = 60      // 실루엣 마스크 재계산 주기 (≈16fps, 표시는 60fps 유지)
+const GESTURE_REFRESH_MS = 50   // 인터랙션 사용 시 손 추적 주기 (≈20fps)
 const SPOTIFY_GREEN = '#1DB954'
 
 // 공식 Spotify 아이콘 SVG (viewBox 168×168). 한 번만 Image로 디코딩해서 캐싱
@@ -108,6 +109,7 @@ export default function App() {
   const tracksRef = useRef<Track[]>([])
   const nextIdRef = useRef(1)
   const lastGestureRef = useRef<GestureRecognizerResult | null>(null)
+  const lastGestureTsRef = useRef(0)
   const lastSegMaskRef = useRef<ImageSegmenterResult | null>(null)
   const silhouetteCacheRef = useRef<{ canvas: HTMLCanvasElement; shape: ShapeMode; ts: number } | null>(null)
   // skip-track 용 손 이전 위치 추적
@@ -167,7 +169,7 @@ export default function App() {
           GestureRecognizer.createFromOptions(vision, {
             baseOptions: { modelAssetPath: GESTURE_MODEL, delegate: 'GPU' },
             runningMode: 'VIDEO',
-            numHands: 4,
+            numHands: 2,
           }),
           ImageSegmenter.createFromOptions(vision, {
             baseOptions: { modelAssetPath: SEG_MODEL, delegate: 'GPU' },
@@ -265,9 +267,20 @@ export default function App() {
     updateTracks(tracksRef.current, detections, ts, nextIdRef)
     if (tracksRef.current.length !== trackCount) setTrackCount(tracksRef.current.length)
 
-    let gestureResult: GestureRecognizerResult | undefined
-    try { gestureResult = gesture.recognizeForVideo(video, ts) } catch { /* skip */ }
-    if (gestureResult) lastGestureRef.current = gestureResult
+    // GestureRecognizer는 인터랙션이 손을 쓰는 모드일 때만 실행 (가장 비싼 모델)
+    // 또한 throttle: 50ms마다 (≈20fps) — 손동작 인식엔 충분
+    const interactionUsesHands = refs.interaction.current !== 'none' &&
+                                  refs.interaction.current !== 'move-music' &&
+                                  refs.interaction.current !== 'listen-together'
+    if (interactionUsesHands && ts - lastGestureTsRef.current >= GESTURE_REFRESH_MS) {
+      let gestureResult: GestureRecognizerResult | undefined
+      try { gestureResult = gesture.recognizeForVideo(video, ts) } catch { /* skip */ }
+      if (gestureResult) lastGestureRef.current = gestureResult
+      lastGestureTsRef.current = ts
+    } else if (!interactionUsesHands && lastGestureRef.current) {
+      // 손 안 쓰는 모드로 전환되면 즉시 이전 손 데이터 무효화
+      lastGestureRef.current = null
+    }
 
     applyInteractions(
       tracksRef.current,
