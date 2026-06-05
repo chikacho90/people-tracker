@@ -281,7 +281,7 @@ export default function App() {
         if (seg) lastSegMaskRef.current = seg
       } catch { /* skip */ }
       if (lastSegMaskRef.current) {
-        drawSilhouette(ctx, lastSegMaskRef.current, vw, vh, mirrored, shapeMode)
+        drawSilhouette(ctx, lastSegMaskRef.current, vw, vh, mirrored, shapeMode, tracksRef.current)
       }
     }
     if (shapeMode === 'box') {
@@ -976,6 +976,7 @@ function drawSilhouette(
   vh: number,
   mirrored: boolean,
   mode: ShapeMode,
+  tracks: Track[],
 ) {
   const mask = seg.categoryMask
   if (!mask) return
@@ -988,7 +989,41 @@ function drawSilhouette(
   const img = offCtx.createImageData(w, h)
 
   // person/배경 판정 — selfie_segmenter는 일반적으로 person이 0
-  const isPersonFn = (v: number) => v === 0
+  const rawIsPerson = (v: number) => v === 0
+
+  // ObjectDetector가 잡은 사람 bbox 안쪽 픽셀만 person으로 인정 (의자/가구 등 가짜 person 제거)
+  // bbox는 비디오 좌표, mask는 mask 해상도 → 스케일 변환해서 매 픽셀 비교
+  const sx = vw / w
+  const sy = vh / h
+  // 박스에 패딩 좀 더 — 마스크가 박스 살짝 넘는 손/머리카락 포함 위해
+  const padded = tracks.map((t) => {
+    const pad = Math.max(t.bbox.w * 0.18, 24)
+    return {
+      x1: t.bbox.x - pad,
+      y1: t.bbox.y - pad,
+      x2: t.bbox.x + t.bbox.w + pad,
+      y2: t.bbox.y + t.bbox.h + pad,
+    }
+  })
+  const hasTracks = padded.length > 0
+  const isPersonFn = (v: number, xx: number, yy: number) => {
+    if (!rawIsPerson(v)) return false
+    if (!hasTracks) return false  // 트랙 없으면 전부 background 처리 (가구 false-positive 제거)
+    const px = xx * sx, py = yy * sy
+    for (const b of padded) {
+      if (px >= b.x1 && px <= b.x2 && py >= b.y1 && py <= b.y2) return true
+    }
+    return false
+  }
+
+  // 일단 person 영역 binary 마스크 미리 계산 (트랙 bbox 필터 포함)
+  const personMask = new Uint8Array(data.length)
+  for (let yy = 0; yy < h; yy++) {
+    for (let xx = 0; xx < w; xx++) {
+      const i = yy * w + xx
+      if (isPersonFn(data[i], xx, yy)) personMask[i] = 1
+    }
+  }
 
   if (mode === 'silhouette-outline') {
     // 윤곽선 — 두꺼운 stroke 만들기 위해 반경 3까지의 이웃 비교(dilation 효과)
@@ -997,7 +1032,7 @@ function drawSilhouette(
     for (let yy = 0; yy < h; yy++) {
       for (let xx = 0; xx < w; xx++) {
         const i = yy * w + xx
-        const p = isPersonFn(data[i])
+        const p = personMask[i]
         let isEdge = false
         for (let dy = -radius; dy <= radius && !isEdge; dy++) {
           const ny = yy + dy
@@ -1006,7 +1041,7 @@ function drawSilhouette(
             if (dx === 0 && dy === 0) continue
             const nx = xx + dx
             if (nx < 0 || nx >= w) continue
-            if (isPersonFn(data[ny * w + nx]) !== p) isEdge = true
+            if (personMask[ny * w + nx] !== p) isEdge = true
           }
         }
         const o = i * 4
@@ -1023,8 +1058,7 @@ function drawSilhouette(
     const baseG = targetIsPerson ? 120 : 255
     const baseB = targetIsPerson ? 60 : 200
     for (let i = 0; i < data.length; i++) {
-      const v = data[i]
-      const matches = targetIsPerson ? isPersonFn(v) : !isPersonFn(v)
+      const matches = targetIsPerson ? (personMask[i] === 1) : (personMask[i] === 0)
       const o = i * 4
       if (matches) {
         img.data[o] = baseR; img.data[o + 1] = baseG; img.data[o + 2] = baseB; img.data[o + 3] = 120
