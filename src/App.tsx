@@ -45,7 +45,7 @@ const spotifyImage: HTMLImageElement = (() => {
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 type BBox = { x: number; y: number; w: number; h: number }
-type EffectType = 'none' | 'pop' | 'bounce' | 'orbit' | 'multiply' | 'breathe' | 'pulse'
+type EffectType = 'none' | 'pop' | 'bounce' | 'orbit' | 'multiply' | 'breathe' | 'pulse' | 'reactions'
 type ShapeMode = 'none' | 'box' | 'silhouette-bg' | 'silhouette-fg' | 'silhouette-outline'
 type InteractionMode =
   | 'none' | 'move-music' | 'volume-up' | 'tap-like' | 'listen-together'
@@ -811,6 +811,15 @@ function drawEffect(
       ctx.restore()
       break
     }
+    case 'reactions': {
+      // 머리 위에 표시되는 이모지 시퀀스 (샘플 이미지 시퀀스 애니메이션)
+      // anchor.cx는 스포티파이 위치(머리 우측)이므로 머리 중앙 위로 보정
+      const headTopX = (mirrored ? vw - (anchor.headCx + t.togetherOffset.x) : (anchor.headCx + t.togetherOffset.x))
+      const headTopY = t.bbox.y - anchor.headSize * 0.25 + t.togetherOffset.y
+      const size = anchor.headSize * 1.2 * entryScale * volMul * moveMul
+      drawReactionEmoji(ctx, headTopX, headTopY, size, ts, t.id)
+      break
+    }
   }
 
   ctx.restore()
@@ -893,6 +902,45 @@ function drawHeart(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: num
   ctx.bezierCurveTo(0, 9, 8, 4, 8, 0)
   ctx.bezierCurveTo(8, -6, 0, -2, 0, 4)
   ctx.fill()
+  ctx.restore()
+}
+
+// 샘플 이모지 시퀀스 (각 글리프 = 컬러 이미지) — 7개 순환 + crossfade
+const REACTION_EMOJIS = ['🎵', '🎶', '❤️', '⭐', '✨', '🎉', '🔥']
+const REACTION_FRAME_MS = 600
+
+function drawReactionEmoji(ctx: CanvasRenderingContext2D, cx: number, cy: number, size: number, ts: number, seed: number) {
+  if (size < 4) return
+  const offset = seed * 137
+  const phase = ((ts + offset) % REACTION_FRAME_MS) / REACTION_FRAME_MS  // 0..1
+  const total = REACTION_EMOJIS.length
+  const idx = Math.floor((ts + offset) / REACTION_FRAME_MS) % total
+  const nextIdx = (idx + 1) % total
+
+  // 80% steady + 20% crossfade + 등장 bounce
+  const fadeStart = 0.8
+  const fadeAmount = phase > fadeStart ? (phase - fadeStart) / (1 - fadeStart) : 0
+  const inBounce = phase < 0.15 ? Math.sin((phase / 0.15) * Math.PI) * 0.15 : 0  // 등장 시 살짝 튀어오름
+
+  const float = Math.sin(ts / 1000 + seed * 0.5) * size * 0.06
+  const wobble = Math.sin(ts / 800 + seed) * 0.06
+
+  ctx.save()
+  ctx.font = `${size}px -apple-system, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif`
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.translate(cx, cy + float)
+  ctx.rotate(wobble)
+  const scale = 1 + inBounce
+  ctx.scale(scale, scale)
+
+  const baseAlpha = ctx.globalAlpha
+  ctx.globalAlpha = baseAlpha * (1 - fadeAmount)
+  ctx.fillText(REACTION_EMOJIS[idx], 0, 0)
+  if (fadeAmount > 0.01) {
+    ctx.globalAlpha = baseAlpha * fadeAmount
+    ctx.fillText(REACTION_EMOJIS[nextIdx], 0, 0)
+  }
   ctx.restore()
 }
 
@@ -1243,7 +1291,7 @@ function BottomPanel(props: {
             ))}
           </Row>
           <Row label="Effect">
-            {(['none', 'pop', 'bounce', 'orbit', 'multiply', 'breathe', 'pulse'] as EffectType[]).map((e) => (
+            {(['none', 'pop', 'bounce', 'orbit', 'multiply', 'breathe', 'pulse', 'reactions'] as EffectType[]).map((e) => (
               <Toggle key={e} on={effect === e} onClick={() => setEffect(e)}>{effectLabel(e)}</Toggle>
             ))}
           </Row>
@@ -1265,7 +1313,7 @@ function shapeLabel(s: ShapeMode): string {
   return ({ 'none': 'None', 'box': 'Box', 'silhouette-bg': 'Silhouette-bg', 'silhouette-fg': 'Silhouette-fg', 'silhouette-outline': 'Outline' } as const)[s]
 }
 function effectLabel(e: EffectType): string {
-  return ({ 'none': 'None', 'pop': 'Pop', 'bounce': 'Bounce', 'orbit': 'Orbit', 'multiply': 'Multiply', 'breathe': 'Breathe', 'pulse': 'Pulse' } as const)[e]
+  return ({ 'none': 'None', 'pop': 'Pop', 'bounce': 'Bounce', 'orbit': 'Orbit', 'multiply': 'Multiply', 'breathe': 'Breathe', 'pulse': 'Pulse', 'reactions': 'Reactions' } as const)[e]
 }
 function interactionLabel(m: InteractionMode): string {
   return ({
