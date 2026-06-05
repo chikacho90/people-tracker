@@ -1018,14 +1018,35 @@ function drawSilhouette(
     return false
   }
 
-  // 일단 person 영역 binary 마스크 미리 계산 (트랙 bbox 필터 포함)
-  const personMask = new Uint8Array(data.length)
+  // 1) raw person mask (multiclass + bbox)
+  const rawMask = new Uint8Array(data.length)
   for (let yy = 0; yy < h; yy++) {
     for (let xx = 0; xx < w; xx++) {
       const i = yy * w + xx
-      if (isPersonFn(data[i], xx, yy)) personMask[i] = 1
+      if (isPersonFn(data[i], xx, yy)) rawMask[i] = 1
     }
   }
+
+  // 2) 얇은 연결(예: 손→베개) 끊기 위해 erode
+  const eroded = erodeBinary(rawMask, w, h, 2)
+
+  // 3) 각 트랙의 얼굴/상체 부근 seed에서만 flood-fill → 본체와 연결된 영역만 유지
+  //    (베개/의자는 erode로 본체와 분리되므로 flood-fill에 안 잡힘)
+  const seeds: number[] = []
+  for (const t of tracks) {
+    const cxv = t.bbox.x + t.bbox.w * 0.5
+    // 얼굴 가능성 높은 위치 여러 곳을 후보로
+    const ys = [t.bbox.y + t.bbox.h * 0.18, t.bbox.y + t.bbox.h * 0.32, t.bbox.y + t.bbox.h * 0.5]
+    for (const yv of ys) {
+      const mx = Math.floor(cxv / sx)
+      const my = Math.floor(yv / sy)
+      if (mx >= 0 && mx < w && my >= 0 && my < h) seeds.push(my * w + mx)
+    }
+  }
+  const flooded = floodFillFromSeeds(eroded, w, h, seeds)
+
+  // 4) dilate 3 — erode로 줄어든 크기 복구
+  const personMask = dilateBinary(flooded, w, h, 3)
 
   if (mode === 'silhouette-outline') {
     // 윤곽선 — 두꺼운 stroke 만들기 위해 반경 3까지의 이웃 비교(dilation 효과)
@@ -1102,6 +1123,68 @@ function drawSilhouette(
 
 const COLORS = ['#7ee', '#ff7', '#f7f', '#7f7', '#f77', '#77f', '#fa7', '#7fa', '#a7f', '#f7a']
 function colorForId(id: number): string { return COLORS[id % COLORS.length] }
+
+// ─── 마스크 morphology / flood-fill ────────────────────
+
+function erodeBinary(src: Uint8Array, w: number, h: number, steps: number): Uint8Array {
+  let curr = src
+  for (let s = 0; s < steps; s++) {
+    const next = new Uint8Array(curr.length)
+    for (let yy = 1; yy < h - 1; yy++) {
+      const row = yy * w
+      for (let xx = 1; xx < w - 1; xx++) {
+        const i = row + xx
+        if (curr[i] && curr[i - 1] && curr[i + 1] && curr[i - w] && curr[i + w]) next[i] = 1
+      }
+    }
+    curr = next
+  }
+  return curr
+}
+
+function dilateBinary(src: Uint8Array, w: number, h: number, steps: number): Uint8Array {
+  let curr = src
+  for (let s = 0; s < steps; s++) {
+    const next = new Uint8Array(curr.length)
+    for (let yy = 0; yy < h; yy++) {
+      const row = yy * w
+      for (let xx = 0; xx < w; xx++) {
+        const i = row + xx
+        if (curr[i]) { next[i] = 1; continue }
+        if (xx > 0 && curr[i - 1]) { next[i] = 1; continue }
+        if (xx < w - 1 && curr[i + 1]) { next[i] = 1; continue }
+        if (yy > 0 && curr[i - w]) { next[i] = 1; continue }
+        if (yy < h - 1 && curr[i + w]) { next[i] = 1; continue }
+      }
+    }
+    curr = next
+  }
+  return curr
+}
+
+function floodFillFromSeeds(mask: Uint8Array, w: number, h: number, seedIndices: number[]): Uint8Array {
+  const out = new Uint8Array(mask.length)
+  const visited = new Uint8Array(mask.length)
+  const stack: number[] = []
+  for (const seed of seedIndices) {
+    if (seed < 0 || seed >= mask.length) continue
+    if (!mask[seed] || visited[seed]) continue
+    stack.push(seed)
+    while (stack.length > 0) {
+      const j = stack.pop()!
+      if (visited[j] || !mask[j]) continue
+      visited[j] = 1
+      out[j] = 1
+      const xx = j % w
+      const yy = (j - xx) / w
+      if (xx > 0) stack.push(j - 1)
+      if (xx < w - 1) stack.push(j + 1)
+      if (yy > 0) stack.push(j - w)
+      if (yy < h - 1) stack.push(j + w)
+    }
+  }
+  return out
+}
 
 // ─── UI ──────────────────────────────────────────────────
 
