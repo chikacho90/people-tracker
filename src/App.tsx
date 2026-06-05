@@ -30,6 +30,7 @@ const DROP_BURST_MS = 800
 const SKIP_BURST_MS = 700
 const TOGETHER_RANGE_PX = 320
 const HEAD_DIST_NEAR_X = 0.4    // bbox 중심 거리/평균 bbox.w 이하 시 가까움
+const MASK_REFRESH_MS = 60      // 실루엣 마스크 재계산 주기 (≈16fps, 표시는 60fps 유지)
 const SPOTIFY_GREEN = '#1DB954'
 
 // 공식 Spotify 아이콘 SVG (viewBox 168×168). 한 번만 Image로 디코딩해서 캐싱
@@ -108,6 +109,7 @@ export default function App() {
   const nextIdRef = useRef(1)
   const lastGestureRef = useRef<GestureRecognizerResult | null>(null)
   const lastSegMaskRef = useRef<ImageSegmenterResult | null>(null)
+  const silhouetteCacheRef = useRef<{ canvas: HTMLCanvasElement; shape: ShapeMode; ts: number } | null>(null)
   // skip-track 용 손 이전 위치 추적
   const lastHandPosRef = useRef<{ x: number; y: number; ts: number }[]>([])
   // group-sync 글로벌 hue
@@ -278,13 +280,24 @@ export default function App() {
 
     const shapeMode = refs.shape.current
     if (shapeMode === 'silhouette-bg' || shapeMode === 'silhouette-fg' || shapeMode === 'silhouette-outline') {
-      try {
-        const seg = segmenter.segmentForVideo(video, ts)
-        if (seg) lastSegMaskRef.current = seg
-      } catch { /* skip */ }
-      if (lastSegMaskRef.current) {
-        drawSilhouette(ctx, lastSegMaskRef.current, vw, vh, mirrored, shapeMode, tracksRef.current)
+      const cache = silhouetteCacheRef.current
+      const cacheStale = !cache || cache.shape !== shapeMode || (ts - cache.ts) > MASK_REFRESH_MS
+      if (cacheStale) {
+        try {
+          const seg = segmenter.segmentForVideo(video, ts)
+          if (seg) {
+            lastSegMaskRef.current = seg
+            const canvas = buildSilhouetteCanvas(seg, tracksRef.current, vw, vh, shapeMode)
+            if (canvas) silhouetteCacheRef.current = { canvas, shape: shapeMode, ts }
+          }
+        } catch { /* skip */ }
       }
+      const finalCache = silhouetteCacheRef.current
+      if (finalCache && finalCache.shape === shapeMode) {
+        renderSilhouetteCache(ctx, finalCache.canvas, vw, vh, mirrored, shapeMode)
+      }
+    } else if (silhouetteCacheRef.current) {
+      silhouetteCacheRef.current = null
     }
     if (shapeMode === 'box') {
       for (const t of tracksRef.current) drawBBox(ctx, t, vw, mirrored)
@@ -971,20 +984,20 @@ function drawHeadLabel(ctx: CanvasRenderingContext2D, t: Track, displayNum: numb
   ctx.restore()
 }
 
-function drawSilhouette(
-  ctx: CanvasRenderingContext2D,
+// 무거운 마스크 처리 — 캐시용 offscreen canvas 반환 (60ms마다 한 번만 호출)
+function buildSilhouetteCanvas(
   seg: ImageSegmenterResult,
+  tracks: Track[],
   vw: number,
   vh: number,
-  mirrored: boolean,
   mode: ShapeMode,
-  tracks: Track[],
-) {
+): HTMLCanvasElement | null {
   const mask = seg.categoryMask
-  if (!mask) return
+  if (!mask) return null
   const w = mask.width
   const h = mask.height
   const data = mask.getAsUint8Array()
+  void vh
   const off = document.createElement('canvas')
   off.width = w; off.height = h
   const offCtx = off.getContext('2d')!
@@ -1027,8 +1040,8 @@ function drawSilhouette(
     }
   }
 
-  // 2) 얇은 연결(예: 손→베개) 끊기 위해 erode
-  const eroded = erodeBinary(rawMask, w, h, 2)
+  // 2) 얇은 연결(예: 손→베개) 끊기 위해 erode (1패스로 줄여 성능 확보)
+  const eroded = erodeBinary(rawMask, w, h, 1)
 
   // 3) 각 트랙의 얼굴/상체 부근 seed에서만 flood-fill → 본체와 연결된 영역만 유지
   //    (베개/의자는 erode로 본체와 분리되므로 flood-fill에 안 잡힘)
@@ -1045,34 +1058,20 @@ function drawSilhouette(
   }
   const flooded = floodFillFromSeeds(eroded, w, h, seeds)
 
-  // 4) dilate 3 — erode로 줄어든 크기 복구
-  const personMask = dilateBinary(flooded, w, h, 3)
+  // 4) dilate 2 — erode로 줄어든 크기 복구 (성능)
+  const personMask = dilateBinary(flooded, w, h, 2)
 
   if (mode === 'silhouette-outline') {
-    // 윤곽선 — 두꺼운 stroke 만들기 위해 반경 3까지의 이웃 비교(dilation 효과)
+    // 윤곽선 — 두께를 위해 personMask와 그 dilated 버전의 차집합 사용 (O(n) 한 번)
+    const dilatedForEdge = dilateBinary(personMask, w, h, 2)
     const baseR = 255, baseG = 60, baseB = 60
-    const radius = 3
-    for (let yy = 0; yy < h; yy++) {
-      for (let xx = 0; xx < w; xx++) {
-        const i = yy * w + xx
-        const p = personMask[i]
-        let isEdge = false
-        for (let dy = -radius; dy <= radius && !isEdge; dy++) {
-          const ny = yy + dy
-          if (ny < 0 || ny >= h) continue
-          for (let dx = -radius; dx <= radius && !isEdge; dx++) {
-            if (dx === 0 && dy === 0) continue
-            const nx = xx + dx
-            if (nx < 0 || nx >= w) continue
-            if (personMask[ny * w + nx] !== p) isEdge = true
-          }
-        }
-        const o = i * 4
-        if (isEdge) {
-          img.data[o] = baseR; img.data[o + 1] = baseG; img.data[o + 2] = baseB; img.data[o + 3] = 230
-        } else {
-          img.data[o] = 0; img.data[o + 1] = 0; img.data[o + 2] = 0; img.data[o + 3] = 0
-        }
+    for (let i = 0; i < personMask.length; i++) {
+      const isEdge = dilatedForEdge[i] === 1 && personMask[i] === 0
+      const o = i * 4
+      if (isEdge) {
+        img.data[o] = baseR; img.data[o + 1] = baseG; img.data[o + 2] = baseB; img.data[o + 3] = 230
+      } else {
+        img.data[o] = 0; img.data[o + 1] = 0; img.data[o + 2] = 0; img.data[o + 3] = 0
       }
     }
   } else {
@@ -1091,22 +1090,30 @@ function drawSilhouette(
     }
   }
   offCtx.putImageData(img, 0, 0)
+  return off
+}
 
+// 가벼운 렌더링 — 캐시된 offscreen canvas를 메인에 그리기만 (매 프레임 60fps)
+function renderSilhouetteCache(
+  ctx: CanvasRenderingContext2D,
+  off: HTMLCanvasElement,
+  vw: number,
+  vh: number,
+  mirrored: boolean,
+  mode: ShapeMode,
+) {
   ctx.save()
   if (mirrored) { ctx.translate(vw, 0); ctx.scale(-1, 1) }
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
   if (mode === 'silhouette-outline') {
-    // 1) 부드러운 외곽 글로우 (큰 블러)
-    ctx.imageSmoothingEnabled = true
-    ctx.imageSmoothingQuality = 'high'
-    ctx.shadowColor = 'transparent'
-    ctx.filter = 'blur(10px)'
+    // 부드러운 글로우 한 번 + 또렷한 선 한 번 (둘 다 캐시된 작은 마스크 사용)
+    ctx.filter = 'blur(6px)'
     ctx.globalCompositeOperation = 'lighter'
-    ctx.drawImage(off, 0, 0, vw, vh)
-    // 2) 또렷한 안쪽 outline (작은 블러 — 지글거림 제거)
-    ctx.filter = 'blur(2.5px)'
     ctx.drawImage(off, 0, 0, vw, vh)
     ctx.filter = 'none'
     ctx.globalCompositeOperation = 'source-over'
+    ctx.drawImage(off, 0, 0, vw, vh)
   } else {
     ctx.globalCompositeOperation = 'screen'
     ctx.drawImage(off, 0, 0, vw, vh)
@@ -1117,6 +1124,7 @@ function drawSilhouette(
       ctx.drawImage(off, 0, 0, vw, vh)
       ctx.shadowBlur = 0
     }
+    ctx.globalCompositeOperation = 'source-over'
   }
   ctx.restore()
 }
