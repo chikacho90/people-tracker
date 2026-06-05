@@ -12,7 +12,9 @@ import {
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm'
 const OBJ_MODEL = 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite'
 const GESTURE_MODEL = 'https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task'
-const SEG_MODEL = 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/1/selfie_segmenter.tflite'
+// selfie_multiclass: 0=background, 1=hair, 2=body-skin, 3=face-skin, 4=clothes, 5=others
+// (단일 셀카 선호하지만 셀피세그멘터보다 의자/가구를 person으로 잡는 빈도 낮음)
+const SEG_MODEL = 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/1/selfie_multiclass_256x256.tflite'
 
 const MAX_DETECTIONS = 20
 const TRACK_TIMEOUT_MS = 800
@@ -988,16 +990,16 @@ function drawSilhouette(
   const offCtx = off.getContext('2d')!
   const img = offCtx.createImageData(w, h)
 
-  // person/배경 판정 — selfie_segmenter는 일반적으로 person이 0
-  const rawIsPerson = (v: number) => v === 0
+  // selfie_multiclass — 0=background, 1=hair, 2=body-skin, 3=face-skin, 4=clothes, 5=others/accessories
+  // 0이 아니면 사람의 일부로 간주
+  const rawIsPerson = (v: number) => v !== 0
 
-  // ObjectDetector가 잡은 사람 bbox 안쪽 픽셀만 person으로 인정 (의자/가구 등 가짜 person 제거)
-  // bbox는 비디오 좌표, mask는 mask 해상도 → 스케일 변환해서 매 픽셀 비교
+  // 트랙 bbox 안쪽 픽셀만 통과 — bbox 밖에 있는 가구/배경 false-positive 차단
   const sx = vw / w
   const sy = vh / h
-  // 박스에 패딩 좀 더 — 마스크가 박스 살짝 넘는 손/머리카락 포함 위해
+  // 패딩 축소: 멀티클래스 모델이 더 정확하므로 작은 마진만 (10% 또는 12px)
   const padded = tracks.map((t) => {
-    const pad = Math.max(t.bbox.w * 0.18, 24)
+    const pad = Math.max(t.bbox.w * 0.10, 12)
     return {
       x1: t.bbox.x - pad,
       y1: t.bbox.y - pad,
