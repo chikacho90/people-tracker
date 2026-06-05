@@ -53,6 +53,13 @@ type ShapeMode = 'none' | 'box' | 'silhouette-bg' | 'silhouette-fg' | 'silhouett
 type InteractionMode =
   | 'none' | 'move-music' | 'volume-up' | 'tap-like' | 'listen-together'
   | 'drop-beat' | 'skip-track' | 'headphones' | 'discover' | 'group-sync'
+type TargetMode = 'none' | 'full-body' | 'face'
+
+// UI에 노출할 옵션들 (코드 path는 모든 값 유지 — 향후 추가 시 옵션만 늘리면 됨)
+const DISPLAY_OPTIONS: ShapeMode[] = ['box', 'silhouette-bg', 'silhouette-fg', 'silhouette-outline']
+const EFFECT_OPTIONS: EffectType[] = ['reactions']
+const INTERACTION_OPTIONS: InteractionMode[] = []  // 비어있음 — 차근차근 추가 예정
+const TARGET_OPTIONS: TargetMode[] = ['full-body', 'face']
 
 type DiscoverLogo = { x: number; y: number; bornAt: number; ttl: number }
 
@@ -90,12 +97,15 @@ export default function App() {
   const [panelOpen, setPanelOpen] = useState(false)
   const [fps, setFps] = useState(0)
   const [trackCount, setTrackCount] = useState(0)
-  const [effect, setEffectState] = useState<EffectType>('none')
-  const [shape, setShape] = useState<ShapeMode>('none')
-  const [interaction, setInteraction] = useState<InteractionMode>('none')
-  const [statusVisible, setStatusVisible] = useState(false)
+  const [effect, setEffectState] = useState<EffectType>('reactions')   // 디폴트 — 각 row 첫 아이템
+  const [shape, setShape] = useState<ShapeMode>('box')                  // 디폴트
+  const [interaction, setInteraction] = useState<InteractionMode>('none')  // 옵션 없음 → none
+  const [target, setTarget] = useState<TargetMode>('full-body')         // 디폴트
+  const [statusVisible, setStatusVisible] = useState(true)              // 디폴트 표시
   const [fsUiVisible, setFsUiVisible] = useState(true)
   const [isFullscreen, setIsFullscreen] = useState(false)
+  const [cameras, setCameras] = useState<MediaDeviceInfo[]>([])
+  const [cameraDeviceId, setCameraDeviceId] = useState<string | null>(null)
 
   const mirrorRef = useRef(true)
   const showOverlayRef = useRef(true)
@@ -103,10 +113,12 @@ export default function App() {
     effect: useRef(effect),
     shape: useRef(shape),
     interaction: useRef(interaction),
+    target: useRef(target),
   }
   useEffect(() => { refs.effect.current = effect }, [effect])
   useEffect(() => { refs.shape.current = shape }, [shape])
   useEffect(() => { refs.interaction.current = interaction }, [interaction])
+  useEffect(() => { refs.target.current = target }, [target])
 
   const tracksRef = useRef<Track[]>([])
   const nextIdRef = useRef(1)
@@ -187,16 +199,8 @@ export default function App() {
         gestureRef.current = gesture
         segmenterRef.current = segmenter
 
-        setStatus('requesting-camera')
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 }, facingMode: 'user' },
-          audio: false,
-        })
-        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return }
-        const video = videoRef.current!
-        video.srcObject = stream
-        await video.play()
         setStatus('running')
+        // 카메라는 별도 useEffect에서 관리. 여기선 loop만 시작.
 
         const loop = () => {
           if (cancelled) return
@@ -225,15 +229,65 @@ export default function App() {
     return () => {
       cancelled = true
       if (raf) cancelAnimationFrame(raf)
-      const video = videoRef.current
-      if (video?.srcObject) {
-        ;(video.srcObject as MediaStream).getTracks().forEach((t) => t.stop())
-        video.srcObject = null
-      }
       detectorRef.current?.close(); detectorRef.current = null
       gestureRef.current?.close(); gestureRef.current = null
       segmenterRef.current?.close(); segmenterRef.current = null
     }
+  }, [])
+
+  // 카메라 스트림 — cameraDeviceId 변경 시 재시작
+  useEffect(() => {
+    let cancelled = false
+    let stream: MediaStream | null = null
+    async function start() {
+      try {
+        setStatus((s) => (s === 'error' ? s : s === 'running' ? s : 'requesting-camera'))
+        const videoConstraint: MediaTrackConstraints = {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 60 },
+        }
+        if (cameraDeviceId) videoConstraint.deviceId = { exact: cameraDeviceId }
+        else videoConstraint.facingMode = 'user'
+        stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraint, audio: false })
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return }
+        const video = videoRef.current
+        if (video) {
+          if (video.srcObject) {
+            ;(video.srcObject as MediaStream).getTracks().forEach((t) => t.stop())
+          }
+          video.srcObject = stream
+          await video.play()
+        }
+        // 권한 받은 뒤엔 카메라 라벨 사용 가능 → 목록 다시 로드
+        try {
+          const devs = await navigator.mediaDevices.enumerateDevices()
+          if (!cancelled) setCameras(devs.filter((d) => d.kind === 'videoinput'))
+        } catch { /* skip */ }
+      } catch (e) {
+        if (!cancelled) {
+          setStatus('error')
+          setErrorMsg(e instanceof Error ? e.message : String(e))
+        }
+      }
+    }
+    start()
+    return () => {
+      cancelled = true
+      if (stream) stream.getTracks().forEach((t) => t.stop())
+    }
+  }, [cameraDeviceId])
+
+  // 카메라 목록 변경 모니터링
+  useEffect(() => {
+    async function reload() {
+      try {
+        const devs = await navigator.mediaDevices.enumerateDevices()
+        setCameras(devs.filter((d) => d.kind === 'videoinput'))
+      } catch { /* skip */ }
+    }
+    navigator.mediaDevices.addEventListener('devicechange', reload)
+    return () => navigator.mediaDevices.removeEventListener('devicechange', reload)
   }, [])
 
   function detectAndRender(ts: number) {
@@ -259,7 +313,9 @@ export default function App() {
     ctx.restore()
 
     // ObjectDetector throttle (≈40fps). 중간 프레임은 기존 트랙 사용 — EMA로 충분히 부드러움
-    if (ts - lastObjectTsRef.current >= OBJECT_REFRESH_MS) {
+    // target === 'none' 이면 검출 자체 스킵
+    const targetMode = refs.target.current
+    if (targetMode !== 'none' && ts - lastObjectTsRef.current >= OBJECT_REFRESH_MS) {
       let objResult: ObjectDetectorResult | undefined
       try { objResult = detector.detectForVideo(video, ts) } catch { return }
       const detections: { bbox: BBox; score: number }[] = []
@@ -269,12 +325,20 @@ export default function App() {
           if (!c || c.categoryName !== 'person' || c.score < SCORE_THRESHOLD) continue
           const b = d.boundingBox
           if (!b) continue
-          detections.push({ bbox: { x: b.originX, y: b.originY, w: b.width, h: b.height }, score: c.score })
+          let bbox: BBox = { x: b.originX, y: b.originY, w: b.width, h: b.height }
+          if (targetMode === 'face') {
+            // 얼굴 영역 추정 — 사람 박스의 상단 35%, 가로는 살짝 중앙으로 narrow
+            bbox = { x: bbox.x + bbox.w * 0.18, y: bbox.y, w: bbox.w * 0.64, h: bbox.h * 0.38 }
+          }
+          detections.push({ bbox, score: c.score })
         }
       }
       updateTracks(tracksRef.current, detections, ts, nextIdRef)
       lastObjectTsRef.current = ts
       if (tracksRef.current.length !== trackCount) setTrackCount(tracksRef.current.length)
+    } else if (targetMode === 'none' && tracksRef.current.length > 0) {
+      tracksRef.current.length = 0
+      if (trackCount !== 0) setTrackCount(0)
     }
 
     // GestureRecognizer는 인터랙션이 손을 쓰는 모드일 때만 실행 (가장 비싼 모델)
@@ -361,9 +425,14 @@ export default function App() {
         effect={effect}
         shape={shape}
         interaction={interaction}
+        target={target}
+        cameras={cameras}
+        cameraDeviceId={cameraDeviceId}
         setEffect={setEffect}
         setShape={setShape}
         setInteraction={setInteraction}
+        setTarget={setTarget}
+        setCameraDeviceId={setCameraDeviceId}
       />
 
       {fsUiVisible && (<FullscreenButton isFullscreen={isFullscreen} />)}
@@ -1299,30 +1368,63 @@ function BottomPanel(props: {
   effect: EffectType
   shape: ShapeMode
   interaction: InteractionMode
+  target: TargetMode
+  cameras: MediaDeviceInfo[]
+  cameraDeviceId: string | null
   setEffect: (e: EffectType) => void
   setShape: React.Dispatch<React.SetStateAction<ShapeMode>>
   setInteraction: React.Dispatch<React.SetStateAction<InteractionMode>>
+  setTarget: React.Dispatch<React.SetStateAction<TargetMode>>
+  setCameraDeviceId: React.Dispatch<React.SetStateAction<string | null>>
 }) {
-  const { open, toggle, effect, shape, interaction, setEffect, setShape, setInteraction } = props
+  const { open, toggle, effect, shape, interaction, target,
+    cameras, cameraDeviceId,
+    setEffect, setShape, setInteraction, setTarget, setCameraDeviceId } = props
   return (
     <div style={bottomWrapStyle}>
       {open && (
         <div style={panelStyle}>
-          <Row label="Display">
-            {(['none', 'box', 'silhouette-bg', 'silhouette-fg', 'silhouette-outline'] as ShapeMode[]).map((s) => (
-              <Toggle key={s} on={shape === s} onClick={() => setShape(s)}>{shapeLabel(s)}</Toggle>
-            ))}
-          </Row>
-          <Row label="Effect">
-            {(['none', 'pop', 'bounce', 'orbit', 'multiply', 'breathe', 'pulse', 'reactions'] as EffectType[]).map((e) => (
-              <Toggle key={e} on={effect === e} onClick={() => setEffect(e)}>{effectLabel(e)}</Toggle>
-            ))}
-          </Row>
-          <Row label="Interaction">
-            {(['none', 'move-music', 'volume-up', 'tap-like', 'listen-together', 'drop-beat', 'skip-track', 'headphones', 'discover', 'group-sync'] as InteractionMode[]).map((m) => (
-              <Toggle key={m} on={interaction === m} onClick={() => setInteraction(m)}>{interactionLabel(m)}</Toggle>
-            ))}
-          </Row>
+          {cameras.length > 0 && (
+            <Row label="Camera">
+              {cameras.map((c, i) => (
+                <Toggle
+                  key={c.deviceId || i}
+                  on={cameraDeviceId === c.deviceId || (cameraDeviceId === null && i === 0)}
+                  onClick={() => setCameraDeviceId((prev) => prev === c.deviceId ? null : c.deviceId)}
+                >
+                  {c.label || `Camera ${i + 1}`}
+                </Toggle>
+              ))}
+            </Row>
+          )}
+          {TARGET_OPTIONS.length > 0 && (
+            <Row label="Target">
+              {TARGET_OPTIONS.map((t) => (
+                <Toggle key={t} on={target === t} onClick={() => setTarget((prev) => prev === t ? 'none' : t)}>{targetLabel(t)}</Toggle>
+              ))}
+            </Row>
+          )}
+          {DISPLAY_OPTIONS.length > 0 && (
+            <Row label="Display">
+              {DISPLAY_OPTIONS.map((s) => (
+                <Toggle key={s} on={shape === s} onClick={() => setShape((prev) => prev === s ? 'none' : s)}>{shapeLabel(s)}</Toggle>
+              ))}
+            </Row>
+          )}
+          {EFFECT_OPTIONS.length > 0 && (
+            <Row label="Effect">
+              {EFFECT_OPTIONS.map((e) => (
+                <Toggle key={e} on={effect === e} onClick={() => setEffect(effect === e ? 'none' : e)}>{effectLabel(e)}</Toggle>
+              ))}
+            </Row>
+          )}
+          {INTERACTION_OPTIONS.length > 0 && (
+            <Row label="Interaction">
+              {INTERACTION_OPTIONS.map((m) => (
+                <Toggle key={m} on={interaction === m} onClick={() => setInteraction((prev) => prev === m ? 'none' : m)}>{interactionLabel(m)}</Toggle>
+              ))}
+            </Row>
+          )}
         </div>
       )}
       <button type="button" onClick={toggle} title="Effects panel" style={fabStyle(open)}>
@@ -1351,6 +1453,9 @@ function interactionLabel(m: InteractionMode): string {
     'discover': 'Discover',
     'group-sync': 'Sync',
   } as const)[m]
+}
+function targetLabel(t: TargetMode): string {
+  return ({ 'none': 'None', 'full-body': 'Full body', 'face': 'Face' } as const)[t]
 }
 
 function FullscreenButton({ isFullscreen }: { isFullscreen: boolean }) {
